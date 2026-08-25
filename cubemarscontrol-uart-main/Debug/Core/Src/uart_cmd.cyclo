@@ -1,0 +1,4 @@
+../Core/Src/uart_cmd.c:11:6:uart_cmd_init	1
+../Core/Src/uart_cmd.c:46:13:uart_cmd_motor	2
+../Core/Src/uart_cmd.c:52:13:parse_cmd	13
+../Core/Src/uart_cmd.c:83:6:uart_cmd_feed	4
