@@ -5,6 +5,7 @@
 #define CMD_BUF_SIZE 32
 
 static MotorState motors[NUM_MOTORS];
+static float servo_pos[NUM_SERVOS] = {90.0f, 90.0f, 90.0f};
 static char buf[CMD_BUF_SIZE];
 static uint8_t idx = 0;
 
@@ -40,6 +41,16 @@ void uart_cmd_init(void)
     motors[2].type = MOTOR_TYPE_AK70;
     motors[2].enable_pending = 0;
 
+    // Motor 4: AK40, CAN ID 3
+    motors[3].pos = 0.0f;
+    motors[3].vel = 0.0f;
+    motors[3].kp  = 6.0f;
+    motors[3].kd  = 0.2f;
+    motors[3].tff = 0.0f;
+    motors[3].can_id = 3;
+    motors[3].type = MOTOR_TYPE_AK40;
+    motors[3].enable_pending = 0;
+
     idx = 0;
 }
 
@@ -49,18 +60,34 @@ MotorState *uart_cmd_motor(uint8_t motor_idx)
     return &motors[motor_idx];
 }
 
+float *uart_cmd_servo_pos(void)
+{
+    return servo_pos;
+}
+
 static void parse_cmd(void)
 {
     if (idx < 2) return;
     buf[idx] = '\0';
 
-    // First char is motor number '1','2','3'
     uint8_t motor_num = (uint8_t)(buf[0] - '1');
+    char cmd = buf[1];
+    float val = (idx > 2) ? (float)atof(&buf[2]) : 0.0f;
+
+    // Servo indices: '5','6','7' → motor_num 4,5,6
+    if (motor_num >= NUM_MOTORS && motor_num < NUM_MOTORS + NUM_SERVOS) {
+        if (cmd == 'P' || cmd == 'p') {
+            float angle = val;
+            if (angle < 0.0f) angle = 0.0f;
+            if (angle > 180.0f) angle = 180.0f;
+            servo_pos[motor_num - NUM_MOTORS] = angle;
+        }
+        return;
+    }
+
     if (motor_num >= NUM_MOTORS) return;
 
     MotorState *m = &motors[motor_num];
-    char cmd = buf[1];
-    float val = (idx > 2) ? (float)atof(&buf[2]) : 0.0f;
 
     switch (cmd) {
         case 'P': case 'p': m->pos = val; break;
@@ -73,6 +100,8 @@ static void parse_cmd(void)
         case 'A': case 'a':
             if ((int)val == 70)
                 m->type = MOTOR_TYPE_AK70;
+            else if ((int)val == 40)
+                m->type = MOTOR_TYPE_AK40;
             else
                 m->type = MOTOR_TYPE_AK60;
             break;

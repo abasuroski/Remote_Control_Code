@@ -2,20 +2,24 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Multi-motor UART remote control (3 motors)
+  * @brief          : Robot arm UART remote control (4 motors + 3 servos)
   *
-  * Controls up to 3 CubeMars motors (AK60 or AK70/80) via a single CAN bus.
-  * Parameters received over UART2 at 115200 baud from Python GUI.
+  * Controls up to 4 CubeMars motors (AK60, AK70/80, or AK40) via CAN bus,
+  * and 3 MG995 servos via TIM2 PWM (end effector).
   *
   * Protocol: <motor_num><cmd><value>\n
-  *   motor_num = 1,2,3
-  *   P=position, V=velocity, K=Kp, D=Kd, T=torque, E=enable, I=CAN_ID, A=type
+  *   motor_num = 1-4 (Body: Base, Shoulder, Elbow, Linkage)
+  *   motor_num = 5-7 (End Effector: Wrist1, Wrist2, Gripper)
+  *   P=position (rad for motors, degrees for servos)
+  *   V=velocity, K=Kp, D=Kd, T=torque, E=enable, I=CAN_ID, A=type
   *
   * AK60 uses extended CAN ID:  ExtId = CAN_ID | (8 << 8)
-  *   Frame: [KP_hi][KP_lo|KD_hi][KD_lo][Pos_hi][Pos_lo][Vel_hi][Vel_lo|T_hi][T_lo]
-  *
   * AK70/80 uses standard CAN ID:  StdId = CAN_ID
-  *   Frame: [Pos_hi][Pos_lo][Vel_hi][Vel_lo|KP_hi][KP_lo][KD_hi][KD_lo|T_hi][T_lo]
+  * AK40 uses standard CAN ID (same frame as AK70, different limits)
+  *
+  * Servo PWM: TIM2 @ 50Hz (prescaler=84-1, period=20000-1)
+  *   CH1 (PA0) = Wrist 1, CH2 (PA1) = Wrist 2, CH3 (PB10) = Gripper
+  *   Pulse 500 = 0 deg, Pulse 2500 = 180 deg (MG995 TowerPro)
   *
   * Hardware: STM32F446RE Nucleo + Waveshare CAN shield
   ******************************************************************************
@@ -30,6 +34,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
+TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
@@ -50,6 +55,14 @@ UART_HandleTypeDef huart2;
 #define AK70_T_MIN    -18.0f
 #define AK70_T_MAX     18.0f
 
+// AK40 parameter limits
+#define AK40_P_MIN    -12.5f
+#define AK40_P_MAX     12.5f
+#define AK40_V_MIN    -45.5f
+#define AK40_V_MAX     45.5f
+#define AK40_T_MIN    -5.0f
+#define AK40_T_MAX     5.0f
+
 // Shared limits
 #define KP_MIN    0.0f
 #define KP_MAX    500.0f
@@ -57,6 +70,11 @@ UART_HandleTypeDef huart2;
 #define KD_MAX    5.0f
 
 #define CAN_PACKET_MIT 8
+
+// Servo PWM: 50Hz, 1us resolution (prescaler=84-1, period=20000-1)
+// MG995: 500us (0 deg) to 2500us (180 deg)
+#define SERVO_PULSE_MIN  500
+#define SERVO_PULSE_MAX  2500
 
 // CAN handles
 CAN_TxHeaderTypeDef txHeader;
@@ -67,12 +85,29 @@ uint32_t txMailbox;
 
 uint8_t uart_rx_byte;
 
+// Feedback ring buffer — ISR writes, main loop transmits
+#define FB_BUF_SIZE 512
+static char fb_buf[FB_BUF_SIZE];
+static volatile uint16_t fb_head = 0;
+static volatile uint16_t fb_tail = 0;
+
+static void fb_write(const char *str, int len)
+{
+    for (int i = 0; i < len; i++) {
+        uint16_t next = (fb_head + 1) % FB_BUF_SIZE;
+        if (next == fb_tail) break;  // full, drop
+        fb_buf[fb_head] = str[i];
+        fb_head = next;
+    }
+}
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_CAN1_Init(void);
+static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
@@ -81,12 +116,29 @@ static float        uint_to_float(int x_int, float x_min, float x_max, int bits)
 static void         send_can_frame(void);
 static void         send_ak60_cmd(MotorState *m);
 static void         send_ak70_cmd(MotorState *m);
+static void         send_ak40_cmd(MotorState *m);
 static void         send_ak70_enable(MotorState *m);
 static void         unpack_ak60_reply(uint8_t motor_idx);
 static void         unpack_ak70_reply(uint8_t motor_idx);
+static void         unpack_ak40_reply(uint8_t motor_idx);
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
+
+static uint32_t servo_angle_to_pulse(float angle_deg)
+{
+    if (angle_deg < 0.0f) angle_deg = 0.0f;
+    if (angle_deg > 180.0f) angle_deg = 180.0f;
+    return (uint32_t)(SERVO_PULSE_MIN + (angle_deg / 180.0f) * (SERVO_PULSE_MAX - SERVO_PULSE_MIN));
+}
+
+static void update_servos(void)
+{
+    float *spos = uart_cmd_servo_pos();
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, servo_angle_to_pulse(spos[0]));
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, servo_angle_to_pulse(spos[1]));
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, servo_angle_to_pulse(spos[2]));
+}
 
 static unsigned int float_to_uint(float x, float x_min, float x_max, unsigned int bits)
 {
@@ -161,6 +213,33 @@ static void send_ak70_cmd(MotorState *m)
     send_can_frame();
 }
 
+// AK40: standard CAN ID, same byte order as AK70 but different limits
+static void send_ak40_cmd(MotorState *m)
+{
+    unsigned int p_int  = float_to_uint(m->pos, AK40_P_MIN, AK40_P_MAX, 16);
+    unsigned int v_int  = float_to_uint(m->vel, AK40_V_MIN, AK40_V_MAX, 12);
+    unsigned int kp_int = float_to_uint(m->kp,  KP_MIN, KP_MAX, 12);
+    unsigned int kd_int = float_to_uint(m->kd,  KD_MIN, KD_MAX, 12);
+    unsigned int t_int  = float_to_uint(m->tff, AK40_T_MIN, AK40_T_MAX, 12);
+
+    txData[0] = p_int >> 8;
+    txData[1] = p_int & 0xFF;
+    txData[2] = v_int >> 4;
+    txData[3] = ((v_int & 0xF) << 4) | (kp_int >> 8);
+    txData[4] = kp_int & 0xFF;
+    txData[5] = kd_int >> 4;
+    txData[6] = ((kd_int & 0xF) << 4) | (t_int >> 8);
+    txData[7] = t_int & 0xFF;
+
+    txHeader.StdId              = m->can_id;
+    txHeader.ExtId              = 0;
+    txHeader.IDE                = CAN_ID_STD;
+    txHeader.RTR                = CAN_RTR_DATA;
+    txHeader.DLC                = 8;
+    txHeader.TransmitGlobalTime = DISABLE;
+    send_can_frame();
+}
+
 // AK70/80 enable: 0xFF x7 + 0xFC
 static void send_ak70_enable(MotorState *m)
 {
@@ -182,7 +261,7 @@ static void send_ak70_enable(MotorState *m)
     send_can_frame();
 }
 
-// AK60 feedback: servo-mode format
+// AK60 feedback: servo-mode format (writes to ring buffer, not UART directly)
 static void unpack_ak60_reply(uint8_t motor_idx)
 {
     int16_t pos_int = (int16_t)((rxData[0] << 8) | rxData[1]);
@@ -199,10 +278,10 @@ static void unpack_ak60_reply(uint8_t motor_idx)
     int len = snprintf(buf, sizeof(buf),
         "[M%d] pos=%.1f deg  spd=%.0f eRPM  I=%.2f A  T=%d  err=%d\r\n",
         motor_idx + 1, (double)pos, (double)spd, (double)cur, temp, err);
-    HAL_UART_Transmit(&huart2, (uint8_t*)buf, len, 100);
+    fb_write(buf, len);
 }
 
-// AK70/80 feedback: MIT mode format
+// AK70/80 feedback: MIT mode format (writes to ring buffer)
 static void unpack_ak70_reply(uint8_t motor_idx)
 {
     int p_int = (rxData[1] << 8) | rxData[2];
@@ -219,7 +298,27 @@ static void unpack_ak70_reply(uint8_t motor_idx)
     int len = snprintf(buf, sizeof(buf),
         "[M%d] pos=%.3f rad  vel=%.2f  tau=%.2f  T=%d  err=%d\r\n",
         motor_idx + 1, (double)pos, (double)vel, (double)tau, temp, err);
-    HAL_UART_Transmit(&huart2, (uint8_t*)buf, len, 100);
+    fb_write(buf, len);
+}
+
+// AK40 feedback: same format as AK70 but different limits
+static void unpack_ak40_reply(uint8_t motor_idx)
+{
+    int p_int = (rxData[1] << 8) | rxData[2];
+    int v_int = (rxData[3] << 4) | (rxData[4] >> 4);
+    int i_int = ((rxData[4] & 0xF) << 8) | rxData[5];
+
+    float pos = uint_to_float(p_int, AK40_P_MIN, AK40_P_MAX, 16);
+    float vel = uint_to_float(v_int, AK40_V_MIN, AK40_V_MAX, 12);
+    float tau = uint_to_float(i_int, -AK40_T_MAX, AK40_T_MAX, 12);
+    int8_t temp = (int8_t)(rxData[6] - 40);
+    int8_t err  = (int8_t)rxData[7];
+
+    char buf[96];
+    int len = snprintf(buf, sizeof(buf),
+        "[M%d] pos=%.3f rad  vel=%.2f  tau=%.2f  T=%d  err=%d\r\n",
+        motor_idx + 1, (double)pos, (double)vel, (double)tau, temp, err);
+    fb_write(buf, len);
 }
 
 // Identify which motor sent feedback based on CAN ID
@@ -242,6 +341,8 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
         if (m->can_id == rx_id) {
             if (m->type == MOTOR_TYPE_AK60)
                 unpack_ak60_reply(i);
+            else if (m->type == MOTOR_TYPE_AK40)
+                unpack_ak40_reply(i);
             else
                 unpack_ak70_reply(i);
             HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
@@ -249,11 +350,11 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
         }
     }
 
-    // No match — print debug line so we can see what came in
+    // No match — buffer debug line
     char dbg[64];
     int len = snprintf(dbg, sizeof(dbg), "[M0] unknown CAN id=%d ide=%lu\r\n",
         (int)rx_id, (unsigned long)rxHeader.IDE);
-    HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 50);
+    fb_write(dbg, len);
     HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
 }
 
@@ -273,17 +374,24 @@ int main(void)
     SystemClock_Config();
     MX_GPIO_Init();
     MX_CAN1_Init();
+    MX_TIM2_Init();
     MX_USART2_UART_Init();
 
     /* USER CODE BEGIN 2 */
 
     HAL_CAN_Start(&hcan1);
     HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
-    HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
 
+    // Start servo PWM on all 3 channels
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+    update_servos();
+
     uart_cmd_init();
-    HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);
+    HAL_NVIC_SetPriority(USART2_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
     HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
 
@@ -310,13 +418,25 @@ int main(void)
             // Send position command
             if (m->type == MOTOR_TYPE_AK60)
                 send_ak60_cmd(m);
+            else if (m->type == MOTOR_TYPE_AK40)
+                send_ak40_cmd(m);
             else
                 send_ak70_cmd(m);
 
             HAL_Delay(2);
         }
 
-        HAL_Delay(4);  // ~100 Hz total loop
+        // Update servo PWM outputs
+        update_servos();
+
+        // Drain feedback buffer over UART (non-ISR context)
+        while (fb_tail != fb_head) {
+            uint8_t c = (uint8_t)fb_buf[fb_tail];
+            HAL_UART_Transmit(&huart2, &c, 1, 2);
+            fb_tail = (fb_tail + 1) % FB_BUF_SIZE;
+        }
+
+        HAL_Delay(2);
     }
     /* USER CODE END WHILE */
 }
@@ -381,6 +501,46 @@ static void MX_CAN1_Init(void)
     filter.FilterMode           = CAN_FILTERMODE_IDMASK;
     filter.FilterScale          = CAN_FILTERSCALE_32BIT;
     HAL_CAN_ConfigFilter(&hcan1, &filter);
+}
+
+static void MX_TIM2_Init(void)
+{
+    TIM_OC_InitTypeDef sConfigOC = {0};
+
+    __HAL_RCC_TIM2_CLK_ENABLE();
+
+    htim2.Instance               = TIM2;
+    htim2.Init.Prescaler         = 84 - 1;      // 84MHz / 84 = 1MHz tick (1us)
+    htim2.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    htim2.Init.Period            = 20000 - 1;   // 1MHz / 20000 = 50Hz (20ms)
+    htim2.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) Error_Handler();
+
+    sConfigOC.OCMode     = TIM_OCMODE_PWM1;
+    sConfigOC.Pulse      = 1500;  // default 90 deg
+    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+
+    if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+    if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+    if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK) Error_Handler();
+
+    // Configure GPIO pins for TIM2 PWM output
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    // PA0 = TIM2_CH1 (Wrist 1), PA1 = TIM2_CH2 (Wrist 2)
+    GPIO_InitStruct.Pin       = GPIO_PIN_0 | GPIO_PIN_1;
+    GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull      = GPIO_NOPULL;
+    GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    // PB10 = TIM2_CH3 (Gripper)
+    GPIO_InitStruct.Pin       = GPIO_PIN_10;
+    GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 
 static void MX_USART2_UART_Init(void)

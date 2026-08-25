@@ -1,4 +1,4 @@
 ../Core/Src/uart_cmd.c:11:6:uart_cmd_init	4	static
-../Core/Src/uart_cmd.c:46:13:uart_cmd_motor	16	static
-../Core/Src/uart_cmd.c:52:13:parse_cmd	32	static
-../Core/Src/uart_cmd.c:83:6:uart_cmd_feed	16	static
+../Core/Src/uart_cmd.c:56:13:uart_cmd_motor	16	static
+../Core/Src/uart_cmd.c:62:13:parse_cmd	32	static
+../Core/Src/uart_cmd.c:95:6:uart_cmd_feed	16	static
