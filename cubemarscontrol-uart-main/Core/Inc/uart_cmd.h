@@ -21,6 +21,9 @@ typedef struct {
     uint8_t can_id;
     MotorType type;
     uint8_t enable_pending;
+    uint8_t enabled;
+    volatile float fb_pos;
+    volatile uint8_t fb_received;
 } MotorState;
 
 void         uart_cmd_init(void);

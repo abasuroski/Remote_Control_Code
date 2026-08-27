@@ -71,10 +71,18 @@ UART_HandleTypeDef huart2;
 
 #define CAN_PACKET_MIT 8
 
+// Position rate limit: max rad/s the commanded position can change
+// At 2 rad/s with ~10ms loop, max step per iteration = 0.02 rad
+#define POS_RATE_LIMIT  2.0f
+#define LOOP_DT         0.012f
+
 // Servo PWM: 50Hz, 1us resolution (prescaler=84-1, period=20000-1)
-// MG995: 500us (0 deg) to 2500us (180 deg)
-#define SERVO_PULSE_MIN  500
-#define SERVO_PULSE_MAX  2500
+// MG995: center at 1500us, ~8.33us per degree
+// Pulse clamped to 500-2500us for safety
+#define SERVO_PULSE_CENTER 1500
+#define SERVO_US_PER_DEG   8.333f
+#define SERVO_PULSE_CLAMP_MIN  500
+#define SERVO_PULSE_CLAMP_MAX  2500
 
 // CAN handles
 CAN_TxHeaderTypeDef txHeader;
@@ -84,6 +92,9 @@ uint8_t  rxData[8];
 uint32_t txMailbox;
 
 uint8_t uart_rx_byte;
+
+// Rate-limited commanded position for each motor (ramps toward m->pos)
+static float cmd_pos[NUM_MOTORS] = {0};
 
 // Feedback ring buffer — ISR writes, main loop transmits
 #define FB_BUF_SIZE 512
@@ -127,17 +138,18 @@ static void         unpack_ak40_reply(uint8_t motor_idx);
 
 static uint32_t servo_angle_to_pulse(float angle_deg)
 {
-    if (angle_deg < 0.0f) angle_deg = 0.0f;
-    if (angle_deg > 180.0f) angle_deg = 180.0f;
-    return (uint32_t)(SERVO_PULSE_MIN + (angle_deg / 180.0f) * (SERVO_PULSE_MAX - SERVO_PULSE_MIN));
+    if (angle_deg < -120.0f) angle_deg = -120.0f;
+    if (angle_deg > 120.0f) angle_deg = 120.0f;
+    float pulse = (float)SERVO_PULSE_CENTER + angle_deg * SERVO_US_PER_DEG;
+    return (uint32_t)pulse;
 }
 
 static void update_servos(void)
 {
     float *spos = uart_cmd_servo_pos();
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, servo_angle_to_pulse(spos[0]));
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, servo_angle_to_pulse(spos[1]));
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, servo_angle_to_pulse(spos[2]));
+    TIM2->CCR1 = servo_angle_to_pulse(spos[0]);
+    TIM2->CCR2 = servo_angle_to_pulse(spos[1]);
+    TIM2->CCR3 = servo_angle_to_pulse(spos[2]);
 }
 
 static unsigned int float_to_uint(float x, float x_min, float x_max, unsigned int bits)
@@ -156,6 +168,10 @@ static float uint_to_float(int x_int, float x_min, float x_max, int bits)
 
 static void send_can_frame(void)
 {
+    uint32_t timeout = HAL_GetTick() + 5;
+    while (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0) {
+        if (HAL_GetTick() > timeout) return;
+    }
     HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, &txMailbox);
 }
 
@@ -274,6 +290,10 @@ static void unpack_ak60_reply(uint8_t motor_idx)
     int8_t temp = (int8_t)rxData[6];
     int8_t err  = (int8_t)rxData[7];
 
+    MotorState *m = uart_cmd_motor(motor_idx);
+    m->fb_pos = pos * 0.01745329f;
+    m->fb_received = 1;
+
     char buf[96];
     int len = snprintf(buf, sizeof(buf),
         "[M%d] pos=%.1f deg  spd=%.0f eRPM  I=%.2f A  T=%d  err=%d\r\n",
@@ -294,6 +314,10 @@ static void unpack_ak70_reply(uint8_t motor_idx)
     int8_t temp = (int8_t)(rxData[6] - 40);
     int8_t err  = (int8_t)rxData[7];
 
+    MotorState *m = uart_cmd_motor(motor_idx);
+    m->fb_pos = pos;
+    m->fb_received = 1;
+
     char buf[96];
     int len = snprintf(buf, sizeof(buf),
         "[M%d] pos=%.3f rad  vel=%.2f  tau=%.2f  T=%d  err=%d\r\n",
@@ -313,6 +337,10 @@ static void unpack_ak40_reply(uint8_t motor_idx)
     float tau = uint_to_float(i_int, -AK40_T_MAX, AK40_T_MAX, 12);
     int8_t temp = (int8_t)(rxData[6] - 40);
     int8_t err  = (int8_t)rxData[7];
+
+    MotorState *m = uart_cmd_motor(motor_idx);
+    m->fb_pos = pos;
+    m->fb_received = 1;
 
     char buf[96];
     int len = snprintf(buf, sizeof(buf),
@@ -373,8 +401,8 @@ int main(void)
     HAL_Init();
     SystemClock_Config();
     MX_GPIO_Init();
-    MX_CAN1_Init();
     MX_TIM2_Init();
+    MX_CAN1_Init();
     MX_USART2_UART_Init();
 
     /* USER CODE BEGIN 2 */
@@ -384,10 +412,7 @@ int main(void)
     HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
 
-    // Start servo PWM on all 3 channels
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+    // Servos already started by MX_TIM2_Init (direct register config)
     update_servos();
 
     uart_cmd_init();
@@ -406,16 +431,67 @@ int main(void)
         {
             MotorState *m = uart_cmd_motor(i);
 
-            // Handle pending enable (AK70/80)
+            // Handle pending enable with soft-start
             if (m->enable_pending) {
-                for (int j = 0; j < 10; j++) {
-                    send_ak70_enable(m);
-                    HAL_Delay(5);
+                // AK70/AK40 need MIT mode entry frame
+                if (m->type != MOTOR_TYPE_AK60) {
+                    for (int j = 0; j < 10; j++) {
+                        send_ak70_enable(m);
+                        HAL_Delay(10);
+                    }
+                    HAL_Delay(100);
                 }
+
+                // Soft-start ramp: capture position from first feedback,
+                // then ramp gains at that position (matches raw project behavior)
+                m->fb_received = 0;
+                float kp_target = m->kp;
+                float kd_target = m->kd;
+
+                for (int j = 1; j <= 50; j++) {
+                    // Use feedback position once available
+                    if (m->fb_received && j <= 5) {
+                        m->pos = m->fb_pos;
+                        cmd_pos[i] = m->fb_pos;
+                    }
+
+                    m->kp = kp_target * (float)j / 50.0f;
+                    m->kd = kd_target * (float)j / 50.0f;
+
+                    if (m->type == MOTOR_TYPE_AK60)
+                        send_ak60_cmd(m);
+                    else if (m->type == MOTOR_TYPE_AK40)
+                        send_ak40_cmd(m);
+                    else
+                        send_ak70_cmd(m);
+
+                    HAL_Delay(20);
+                }
+                m->kp = kp_target;
+                m->kd = kd_target;
+
                 m->enable_pending = 0;
+                m->enabled = 1;
             }
 
-            // Send position command
+            // Only send position commands to enabled motors
+            if (!m->enabled) continue;
+
+            // Rate-limit position: ramp cmd_pos toward m->pos
+            float target = m->pos;
+            float error = target - cmd_pos[i];
+            float max_step = POS_RATE_LIMIT * LOOP_DT;
+            if (error > max_step)
+                cmd_pos[i] += max_step;
+            else if (error < -max_step)
+                cmd_pos[i] -= max_step;
+            else
+                cmd_pos[i] = target;
+
+            // Send with rate-limited position
+            float saved_pos = m->pos;
+            m->pos = cmd_pos[i];
+
             if (m->type == MOTOR_TYPE_AK60)
                 send_ak60_cmd(m);
             else if (m->type == MOTOR_TYPE_AK40)
@@ -423,6 +499,7 @@ int main(void)
             else
                 send_ak70_cmd(m);
 
+            m->pos = saved_pos;
             HAL_Delay(2);
         }
 
@@ -483,7 +560,7 @@ static void MX_CAN1_Init(void)
     hcan1.Init.TimeSeg1         = CAN_BS1_11TQ;
     hcan1.Init.TimeSeg2         = CAN_BS2_2TQ;
     hcan1.Init.TimeTriggeredMode    = DISABLE;
-    hcan1.Init.AutoBusOff           = DISABLE;
+    hcan1.Init.AutoBusOff           = ENABLE;
     hcan1.Init.AutoWakeUp           = DISABLE;
     hcan1.Init.AutoRetransmission   = DISABLE;
     hcan1.Init.ReceiveFifoLocked    = DISABLE;
@@ -505,42 +582,49 @@ static void MX_CAN1_Init(void)
 
 static void MX_TIM2_Init(void)
 {
-    TIM_OC_InitTypeDef sConfigOC = {0};
+    // Direct register setup — bypasses HAL state machine issues
 
-    __HAL_RCC_TIM2_CLK_ENABLE();
+    // 1. Enable TIM2 clock
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+    __DSB();  // ensure clock is active before accessing registers
 
-    htim2.Instance               = TIM2;
-    htim2.Init.Prescaler         = 84 - 1;      // 84MHz / 84 = 1MHz tick (1us)
-    htim2.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim2.Init.Period            = 20000 - 1;   // 1MHz / 20000 = 50Hz (20ms)
-    htim2.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) Error_Handler();
+    // 2. Configure PA0 (TIM2_CH1) and PA1 (TIM2_CH2) as AF1
+    //    MODER = 10 (alternate function), AFRL = 0001 (AF1 = TIM2)
+    GPIOA->MODER   &= ~(GPIO_MODER_MODER0 | GPIO_MODER_MODER1);
+    GPIOA->MODER   |=  (2U << (0*2)) | (2U << (1*2));  // AF mode for PA0, PA1
+    GPIOA->OSPEEDR |=  (1U << (0*2)) | (1U << (1*2));  // Medium speed
+    GPIOA->OTYPER  &= ~(GPIO_OTYPER_OT0 | GPIO_OTYPER_OT1);  // Push-pull
+    GPIOA->PUPDR   &= ~(GPIO_PUPDR_PUPD0 | GPIO_PUPDR_PUPD1);  // No pull
+    GPIOA->AFR[0]  &= ~(0xFU << (0*4)) & ~(0xFU << (1*4));
+    GPIOA->AFR[0]  |=  (1U << (0*4)) | (1U << (1*4));  // AF1 for PA0, PA1
 
-    sConfigOC.OCMode     = TIM_OCMODE_PWM1;
-    sConfigOC.Pulse      = 1500;  // default 90 deg
-    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+    // 3. Configure PB10 (TIM2_CH3) as AF1
+    GPIOB->MODER   &= ~(GPIO_MODER_MODER10);
+    GPIOB->MODER   |=  (2U << (10*2));  // AF mode
+    GPIOB->OSPEEDR |=  (1U << (10*2));  // Medium speed
+    GPIOB->OTYPER  &= ~(GPIO_OTYPER_OT10);  // Push-pull
+    GPIOB->PUPDR   &= ~(GPIO_PUPDR_PUPD10);  // No pull
+    GPIOB->AFR[1]  &= ~(0xFU << ((10-8)*4));
+    GPIOB->AFR[1]  |=  (1U << ((10-8)*4));  // AF1 for PB10
 
-    if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
-    if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
-    if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK) Error_Handler();
+    // 4. Configure TIM2: 50Hz PWM, 1us resolution
+    TIM2->PSC  = 84 - 1;     // 84MHz / 84 = 1MHz
+    TIM2->ARR  = 20000 - 1;  // 1MHz / 20000 = 50Hz
+    TIM2->CCR1 = 1500;       // 1.5ms = 90 deg
+    TIM2->CCR2 = 1500;
+    TIM2->CCR3 = 1500;
 
-    // Configure GPIO pins for TIM2 PWM output
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    // PWM mode 1 on CH1, CH2 (CCMR1), CH3 (CCMR2)
+    TIM2->CCMR1 = (6U << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE
+                 | (6U << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;
+    TIM2->CCMR2 = (6U << TIM_CCMR2_OC3M_Pos) | TIM_CCMR2_OC3PE;
 
-    // PA0 = TIM2_CH1 (Wrist 1), PA1 = TIM2_CH2 (Wrist 2)
-    GPIO_InitStruct.Pin       = GPIO_PIN_0 | GPIO_PIN_1;
-    GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull      = GPIO_NOPULL;
-    GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
-    GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    // Enable CH1, CH2, CH3 outputs
+    TIM2->CCER = TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC3E;
 
-    // PB10 = TIM2_CH3 (Gripper)
-    GPIO_InitStruct.Pin       = GPIO_PIN_10;
-    GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    // Generate update event to load prescaler/ARR, then start counter
+    TIM2->EGR = TIM_EGR_UG;
+    TIM2->CR1 = TIM_CR1_CEN;
 }
 
 static void MX_USART2_UART_Init(void)

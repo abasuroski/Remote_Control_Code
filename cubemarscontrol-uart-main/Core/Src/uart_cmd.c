@@ -5,7 +5,7 @@
 #define CMD_BUF_SIZE 32
 
 static MotorState motors[NUM_MOTORS];
-static float servo_pos[NUM_SERVOS] = {90.0f, 90.0f, 90.0f};
+static float servo_pos[NUM_SERVOS] = {0.0f, 0.0f, 0.0f};
 static char buf[CMD_BUF_SIZE];
 static uint8_t idx = 0;
 
@@ -20,8 +20,9 @@ void uart_cmd_init(void)
     motors[0].can_id = 104;
     motors[0].type = MOTOR_TYPE_AK60;
     motors[0].enable_pending = 0;
+    motors[0].enabled = 0;
 
-    // Motor 2: AK70, CAN ID 1
+    // Motor 2: AK70, CAN ID 1 (needs enable)
     motors[1].pos = 0.0f;
     motors[1].vel = 0.0f;
     motors[1].kp  = 6.0f;
@@ -30,8 +31,9 @@ void uart_cmd_init(void)
     motors[1].can_id = 1;
     motors[1].type = MOTOR_TYPE_AK70;
     motors[1].enable_pending = 0;
+    motors[1].enabled = 0;
 
-    // Motor 3: AK70, CAN ID 2
+    // Motor 3: AK70, CAN ID 2 (needs enable)
     motors[2].pos = 0.0f;
     motors[2].vel = 0.0f;
     motors[2].kp  = 6.0f;
@@ -40,8 +42,9 @@ void uart_cmd_init(void)
     motors[2].can_id = 2;
     motors[2].type = MOTOR_TYPE_AK70;
     motors[2].enable_pending = 0;
+    motors[2].enabled = 0;
 
-    // Motor 4: AK40, CAN ID 3
+    // Motor 4: AK40, CAN ID 3 (needs enable)
     motors[3].pos = 0.0f;
     motors[3].vel = 0.0f;
     motors[3].kp  = 6.0f;
@@ -50,6 +53,7 @@ void uart_cmd_init(void)
     motors[3].can_id = 3;
     motors[3].type = MOTOR_TYPE_AK40;
     motors[3].enable_pending = 0;
+    motors[3].enabled = 0;
 
     idx = 0;
 }
@@ -77,10 +81,9 @@ static void parse_cmd(void)
     // Servo indices: '5','6','7' → motor_num 4,5,6
     if (motor_num >= NUM_MOTORS && motor_num < NUM_MOTORS + NUM_SERVOS) {
         if (cmd == 'P' || cmd == 'p') {
-            float angle = val;
-            if (angle < 0.0f) angle = 0.0f;
-            if (angle > 180.0f) angle = 180.0f;
-            servo_pos[motor_num - NUM_MOTORS] = angle;
+            if (val < -120.0f) val = -120.0f;
+            if (val > 120.0f) val = 120.0f;
+            servo_pos[motor_num - NUM_MOTORS] = val;
         }
         return;
     }
@@ -104,6 +107,7 @@ static void parse_cmd(void)
                 m->type = MOTOR_TYPE_AK40;
             else
                 m->type = MOTOR_TYPE_AK60;
+            m->enabled = 0;
             break;
         default: break;
     }

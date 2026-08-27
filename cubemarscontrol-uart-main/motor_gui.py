@@ -152,11 +152,7 @@ class MotorPanel:
         self.send_fn(f"{self.motor_idx}A{code}\n")
 
     def update_enable_visibility(self):
-        t = self.type_var.get()
-        if "70" in t or "40" in t:
-            self.enable_btn.pack(side="left")
-        else:
-            self.enable_btn.pack_forget()
+        self.enable_btn.pack(side="left")
 
     def send_canid(self):
         self.send_fn(f"{self.motor_idx}I{self.canid_var.get()}\n")
@@ -179,6 +175,102 @@ class MotorPanel:
         self.feedback_text.config(state="disabled")
 
 
+class WristDifferentialPanel:
+    """Differential wrist: pitch and roll map to two servos.
+    servo1 = pitch + roll, servo2 = pitch - roll"""
+
+    def __init__(self, parent, send_fn):
+        self.send_fn = send_fn
+
+        self.frame = ttk.LabelFrame(parent, text="Wrist (Differential)")
+        self.frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+
+        ttk.Label(self.frame, text="MG995 TowerPro x2", font=("", 8, "italic")).pack(padx=5, pady=2)
+
+        # --- Pitch slider ---
+        pitch_frame = ttk.LabelFrame(self.frame, text="Pitch (degrees)")
+        pitch_frame.pack(fill="x", padx=5, pady=3)
+
+        self.pitch_var = tk.DoubleVar(value=0.0)
+        ttk.Scale(pitch_frame, from_=-120, to=120, variable=self.pitch_var,
+                  orient="horizontal", length=200).pack(padx=5, pady=3)
+
+        pf = ttk.Frame(pitch_frame)
+        pf.pack(fill="x", padx=5, pady=2)
+        ttk.Entry(pf, textvariable=self.pitch_var, width=7).pack(side="left", padx=3)
+        ttk.Label(pf, text="deg").pack(side="left")
+
+        # --- Roll slider ---
+        roll_frame = ttk.LabelFrame(self.frame, text="Roll (degrees)")
+        roll_frame.pack(fill="x", padx=5, pady=3)
+
+        self.roll_var = tk.DoubleVar(value=0.0)
+        ttk.Scale(roll_frame, from_=-120, to=120, variable=self.roll_var,
+                  orient="horizontal", length=200).pack(padx=5, pady=3)
+
+        rf = ttk.Frame(roll_frame)
+        rf.pack(fill="x", padx=5, pady=2)
+        ttk.Entry(rf, textvariable=self.roll_var, width=7).pack(side="left", padx=3)
+        ttk.Label(rf, text="deg").pack(side="left")
+
+        # --- Computed servo angles display ---
+        calc_frame = ttk.Frame(self.frame)
+        calc_frame.pack(fill="x", padx=5, pady=2)
+        self.calc_label = ttk.Label(calc_frame, text="S1=0.0  S2=0.0", font=("Consolas", 8))
+        self.calc_label.pack()
+
+        # --- Preset buttons ---
+        preset_frame = ttk.Frame(self.frame)
+        preset_frame.pack(fill="x", padx=5, pady=3)
+        ttk.Button(preset_frame, text="Zero", width=5,
+                   command=lambda: self.set_preset(0, 0)).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="P+60", width=5,
+                   command=lambda: self.set_preset(60, 0)).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="P-60", width=5,
+                   command=lambda: self.set_preset(-60, 0)).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="R+60", width=5,
+                   command=lambda: self.set_preset(0, 60)).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="R-60", width=5,
+                   command=lambda: self.set_preset(0, -60)).pack(side="left", padx=2)
+
+        # --- GO button ---
+        ttk.Button(self.frame, text="GO", command=self.send_position).pack(fill="x", padx=5, pady=5, ipady=6)
+
+        # --- Feedback ---
+        fb_frame = ttk.LabelFrame(self.frame, text="Feedback")
+        fb_frame.pack(fill="both", expand=True, padx=5, pady=3)
+
+        self.feedback_text = tk.Text(fb_frame, height=4, width=30, state="disabled", font=("Consolas", 8))
+        self.feedback_text.pack(fill="both", expand=True, padx=3, pady=3)
+
+    def set_preset(self, pitch, roll):
+        self.pitch_var.set(pitch)
+        self.roll_var.set(roll)
+
+    def send_position(self):
+        import time
+        pitch = max(-120.0, min(120.0, self.pitch_var.get()))
+        roll = max(-120.0, min(120.0, self.roll_var.get()))
+        self.pitch_var.set(pitch)
+        self.roll_var.set(roll)
+
+        s1 = max(-120.0, min(120.0, pitch + roll))
+        s2 = max(-120.0, min(120.0, pitch - roll))
+        self.calc_label.config(text=f"S1={s1:.1f}  S2={s2:.1f}")
+
+        self.send_fn(f"5P{s1:.1f}\n")
+        time.sleep(0.005)
+        self.send_fn(f"6P{s2:.1f}\n")
+
+    def append_feedback(self, line):
+        self.feedback_text.config(state="normal")
+        self.feedback_text.insert("end", line + "\n")
+        self.feedback_text.see("end")
+        if int(self.feedback_text.index("end-1c").split(".")[0]) > 100:
+            self.feedback_text.delete("1.0", "2.0")
+        self.feedback_text.config(state="disabled")
+
+
 class ServoPanel:
     def __init__(self, parent, servo_idx, label, send_fn):
         self.servo_idx = servo_idx
@@ -187,16 +279,15 @@ class ServoPanel:
         self.frame = ttk.LabelFrame(parent, text=label)
         self.frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
 
-        # --- Info ---
         ttk.Label(self.frame, text="MG995 TowerPro", font=("", 8, "italic")).pack(padx=5, pady=2)
 
         # --- Position slider ---
         pos_frame = ttk.LabelFrame(self.frame, text="Position (degrees)")
         pos_frame.pack(fill="x", padx=5, pady=5)
 
-        self.pos_var = tk.DoubleVar(value=90.0)
+        self.pos_var = tk.DoubleVar(value=0.0)
 
-        slider = ttk.Scale(pos_frame, from_=0, to=180, variable=self.pos_var,
+        slider = ttk.Scale(pos_frame, from_=-120, to=120, variable=self.pos_var,
                            orient="horizontal", length=200)
         slider.pack(padx=5, pady=3)
 
@@ -210,7 +301,7 @@ class ServoPanel:
         # --- Preset buttons ---
         preset_frame = ttk.Frame(self.frame)
         preset_frame.pack(fill="x", padx=5, pady=3)
-        for angle in [0, 45, 90, 135, 180]:
+        for angle in [-120, -60, 0, 60, 120]:
             ttk.Button(preset_frame, text=f"{angle}°", width=4,
                        command=lambda a=angle: self.set_angle(a)).pack(side="left", padx=2)
 
@@ -228,11 +319,8 @@ class ServoPanel:
         self.pos_var.set(angle)
 
     def send_position(self):
-        angle = self.pos_var.get()
-        if angle < 0:
-            angle = 0
-        elif angle > 180:
-            angle = 180
+        angle = max(-120.0, min(120.0, self.pos_var.get()))
+        self.pos_var.set(angle)
         self.send_fn(f"{self.servo_idx}P{angle:.1f}\n")
 
     def append_feedback(self, line):
@@ -305,15 +393,11 @@ class RobotArmGUI:
         ee_frame = ttk.Frame(self.notebook)
         self.notebook.add(ee_frame, text="End Effector")
 
-        self.servo_panels = []
-        servo_configs = [
-            (5, "Wrist 1"),
-            (6, "Wrist 2"),
-            (7, "Gripper"),
-        ]
-        for idx, label in servo_configs:
-            sp = ServoPanel(ee_frame, idx, label, self.send_cmd)
-            self.servo_panels.append(sp)
+        self.wrist_panel = WristDifferentialPanel(ee_frame, self.send_cmd)
+        self.gripper_panel = ServoPanel(ee_frame, 7, "Gripper", self.send_cmd)
+
+        # For feedback routing: index 5,6 → wrist, 7 → gripper
+        self.servo_panels = [self.wrist_panel, self.wrist_panel, self.gripper_panel]
 
         # --- GO ALL servos button ---
         ttk.Button(ee_frame, text="GO ALL", command=self.send_all_servos).pack(fill="x", padx=10, pady=5, ipady=6)
@@ -327,9 +411,10 @@ class RobotArmGUI:
 
     def send_all_servos(self):
         import time
-        for sp in self.servo_panels:
-            sp.send_position()
-            time.sleep(0.005)
+        self.wrist_panel.send_position()
+        time.sleep(0.005)
+        self.gripper_panel.send_position()
+        time.sleep(0.005)
 
     def toggle_connect(self):
         if self.ser and self.ser.is_open:
