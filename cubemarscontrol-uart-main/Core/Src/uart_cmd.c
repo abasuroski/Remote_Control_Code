@@ -21,6 +21,7 @@ void uart_cmd_init(void)
     motors[0].type = MOTOR_TYPE_AK60;
     motors[0].enable_pending = 0;
     motors[0].enabled = 0;
+    motors[0].set_origin_pending = 0;
 
     // Motor 2: AK70, CAN ID 1 (needs enable)
     motors[1].pos = 0.0f;
@@ -32,6 +33,7 @@ void uart_cmd_init(void)
     motors[1].type = MOTOR_TYPE_AK70;
     motors[1].enable_pending = 0;
     motors[1].enabled = 0;
+    motors[1].set_origin_pending = 0;
 
     // Motor 3: AK70, CAN ID 2 (needs enable)
     motors[2].pos = 0.0f;
@@ -43,6 +45,7 @@ void uart_cmd_init(void)
     motors[2].type = MOTOR_TYPE_AK70;
     motors[2].enable_pending = 0;
     motors[2].enabled = 0;
+    motors[2].set_origin_pending = 0;
 
     // Motor 4: AK40, CAN ID 3 (needs enable)
     motors[3].pos = 0.0f;
@@ -54,6 +57,7 @@ void uart_cmd_init(void)
     motors[3].type = MOTOR_TYPE_AK40;
     motors[3].enable_pending = 0;
     motors[3].enabled = 0;
+    motors[3].set_origin_pending = 0;
 
     idx = 0;
 }
@@ -99,6 +103,7 @@ static void parse_cmd(void)
         case 'D': case 'd': m->kd  = val; break;
         case 'T': case 't': m->tff = val; break;
         case 'E': case 'e': m->enable_pending = 1; break;
+        case 'O': case 'o': m->set_origin_pending = 1; break;
         case 'I': case 'i': m->can_id = (uint8_t)val; break;
         case 'A': case 'a':
             if ((int)val == 70)

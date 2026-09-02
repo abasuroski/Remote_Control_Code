@@ -9,6 +9,7 @@ Protocol (motor index prefix):
   <n>D<val>\n  — Kd
   <n>T<val>\n  — torque feedforward (N·m)
   <n>E\n       — enable motor (AK70/80/AK40 only)
+  <n>O\n       — set origin (zero current position)
   <n>I<val>\n  — set CAN ID
   <n>A<val>\n  — set motor type (60, 70, or 40)
 
@@ -93,6 +94,7 @@ class MotorPanel:
         self.enable_frame.pack(fill="x", padx=5, pady=2)
         self.enable_btn = ttk.Button(self.enable_frame, text="Enable Motor", command=self.send_enable)
         self.enable_btn.pack(side="left")
+        ttk.Button(self.enable_frame, text="Set Origin", command=self.send_set_origin).pack(side="left", padx=(6, 0))
 
         # --- Sliders frame ---
         self.slider_frame = ttk.LabelFrame(self.frame, text="Parameters")
@@ -159,6 +161,9 @@ class MotorPanel:
 
     def send_enable(self):
         self.send_fn(f"{self.motor_idx}E\n")
+
+    def send_set_origin(self):
+        self.send_fn(f"{self.motor_idx}O\n")
 
     def send_all_params(self):
         import time

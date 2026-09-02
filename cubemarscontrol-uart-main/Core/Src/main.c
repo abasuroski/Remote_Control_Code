@@ -129,6 +129,8 @@ static void         send_ak60_cmd(MotorState *m);
 static void         send_ak70_cmd(MotorState *m);
 static void         send_ak40_cmd(MotorState *m);
 static void         send_ak70_enable(MotorState *m);
+static void         send_ak60_set_origin(MotorState *m);
+static void         send_ak70_set_origin(MotorState *m);
 static void         unpack_ak60_reply(uint8_t motor_idx);
 static void         unpack_ak70_reply(uint8_t motor_idx);
 static void         unpack_ak40_reply(uint8_t motor_idx);
@@ -267,6 +269,42 @@ static void send_ak70_enable(MotorState *m)
     txData[5] = 0xFF;
     txData[6] = 0xFF;
     txData[7] = 0xFC;
+
+    txHeader.StdId              = m->can_id;
+    txHeader.ExtId              = 0;
+    txHeader.IDE                = CAN_ID_STD;
+    txHeader.RTR                = CAN_RTR_DATA;
+    txHeader.DLC                = 8;
+    txHeader.TransmitGlobalTime = DISABLE;
+    send_can_frame();
+}
+
+// AK60 set origin: servo mode, extended frame, CAN_PACKET_SET_ORIGIN_HERE (id=5)
+// Data[0]=0 → temporary (cleared on power loss); Data[0]=1 → permanent
+static void send_ak60_set_origin(MotorState *m)
+{
+    txData[0] = 0x00;
+
+    txHeader.StdId              = 0;
+    txHeader.ExtId              = (uint32_t)m->can_id | ((uint32_t)5 << 8);
+    txHeader.IDE                = CAN_ID_EXT;
+    txHeader.RTR                = CAN_RTR_DATA;
+    txHeader.DLC                = 1;
+    txHeader.TransmitGlobalTime = DISABLE;
+    send_can_frame();
+}
+
+// AK70/80/AK40 set origin: 0xFF x7 + 0xFE
+static void send_ak70_set_origin(MotorState *m)
+{
+    txData[0] = 0xFF;
+    txData[1] = 0xFF;
+    txData[2] = 0xFF;
+    txData[3] = 0xFF;
+    txData[4] = 0xFF;
+    txData[5] = 0xFF;
+    txData[6] = 0xFF;
+    txData[7] = 0xFE;
 
     txHeader.StdId              = m->can_id;
     txHeader.ExtId              = 0;
@@ -430,6 +468,18 @@ int main(void)
         for (uint8_t i = 0; i < NUM_MOTORS; i++)
         {
             MotorState *m = uart_cmd_motor(i);
+
+            // Handle set origin
+            if (m->set_origin_pending) {
+                if (m->type == MOTOR_TYPE_AK60)
+                    send_ak60_set_origin(m);
+                else
+                    send_ak70_set_origin(m);
+                HAL_Delay(10);
+                m->pos = 0.0f;
+                cmd_pos[i] = 0.0f;
+                m->set_origin_pending = 0;
+            }
 
             // Handle pending enable with soft-start
             if (m->enable_pending) {

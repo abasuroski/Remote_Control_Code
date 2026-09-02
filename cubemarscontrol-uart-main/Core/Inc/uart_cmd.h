@@ -22,6 +22,7 @@ typedef struct {
     MotorType type;
     uint8_t enable_pending;
     uint8_t enabled;
+    uint8_t set_origin_pending;
     volatile float fb_pos;
     volatile uint8_t fb_received;
 } MotorState;
