@@ -188,7 +188,7 @@ static void send_ak60_cmd(MotorState *m)
 {
     uint16_t kp_int = float_to_uint(m->kp,  KP_MIN, KP_MAX, 12);
     uint16_t kd_int = float_to_uint(m->kd,  KD_MIN, KD_MAX, 12);
-    uint16_t p_int  = float_to_uint(m->pos, AK60_P_MIN, AK60_P_MAX, 16);
+    uint16_t p_int  = float_to_uint(m->pos + m->pos_offset, AK60_P_MIN, AK60_P_MAX, 16);
     uint16_t v_int  = float_to_uint(m->vel, AK60_V_MIN, AK60_V_MAX, 12);
     uint16_t t_int  = float_to_uint(m->tff, AK60_T_MIN, AK60_T_MAX, 12);
 
@@ -289,7 +289,7 @@ static void send_ak70_enable(MotorState *m)
 // Data[0]=0 → temporary (cleared on power loss); Data[0]=1 → permanent
 static void send_ak60_set_origin(MotorState *m)
 {
-    txData[0] = 0x00;
+    txData[0] = 0x02;
 
     txHeader.StdId              = 0;
     txHeader.ExtId              = (uint32_t)m->can_id | ((uint32_t)5 << 8);
@@ -335,13 +335,13 @@ static void unpack_ak60_reply(uint8_t motor_idx)
     int8_t err  = (int8_t)rxData[7];
 
     MotorState *m = uart_cmd_motor(motor_idx);
-    m->fb_pos = pos * 0.01745329f;
+    m->fb_pos = pos * 0.01745329f - m->pos_offset;
     m->fb_received = 1;
 
     char buf[96];
     int len = snprintf(buf, sizeof(buf),
         "[M%d] pos=%.1f deg  spd=%.0f eRPM  I=%.2f A  T=%d  err=%d\r\n",
-        motor_idx + 1, (double)pos, (double)spd, (double)cur, temp, err);
+        motor_idx + 1, (double)(m->fb_pos / 0.01745329f), (double)spd, (double)cur, temp, err);
     fb_write(buf, len);
 }
 
@@ -512,13 +512,17 @@ int main(void)
 
             // Handle set origin
             if (m->set_origin_pending) {
-                if (m->type == MOTOR_TYPE_AK60)
-                    send_ak60_set_origin(m);
-                else
+                if (m->type == MOTOR_TYPE_AK60) {
+                    // Software-only origin: offset translates user coords to MIT coords
+                    // Don't send CAN set origin — it only resets servo feedback, not MIT
+                    m->pos_offset += m->fb_pos;
+                } else {
                     send_ak70_set_origin(m);
+                }
                 HAL_Delay(10);
                 m->pos = 0.0f;
                 cmd_pos[i] = 0.0f;
+                m->fb_pos = 0.0f;
                 m->pid_integral   = 0.0f;
                 m->pid_prev_error = 0.0f;
                 m->set_origin_pending = 0;
@@ -535,16 +539,35 @@ int main(void)
                     HAL_Delay(100);
                 }
 
-                // Soft-start: ramp inner kp/kd up from zero while holding
-                // current position; outer PID is inactive until enabled = 1
                 m->fb_received = 0;
                 float kp_target = m->kp;
                 float kd_target = m->kd;
+
+                // Probe with zero gain for all motor types so the ramp
+                // starts at the actual position instead of 0.
+                m->kp  = 0.0f;
+                m->kd  = 0.0f;
                 m->tff = 0.0f;
+                uint32_t probe_end = HAL_GetTick() + 300;
+                while (!m->fb_received && HAL_GetTick() < probe_end) {
+                    if (m->type == MOTOR_TYPE_AK60)
+                        send_ak60_cmd(m);
+                    else if (m->type == MOTOR_TYPE_AK40)
+                        send_ak40_cmd(m);
+                    else
+                        send_ak70_cmd(m);
+                    HAL_Delay(10);
+                }
+                if (m->fb_received) {
+                    m->pos     = m->fb_pos;
+                    cmd_pos[i] = m->fb_pos;
+                }
+                m->kp = kp_target;
+                m->kd = kd_target;
 
                 for (int j = 1; j <= 50; j++) {
                     if (m->fb_received && j <= 5) {
-                        m->pos = m->fb_pos;
+                        m->pos     = m->fb_pos;
                         cmd_pos[i] = m->fb_pos;
                     }
 
@@ -562,9 +585,10 @@ int main(void)
                 }
                 m->kp = kp_target;
                 m->kd = kd_target;
-                m->pid_integral   = 0.0f;
-                m->pid_prev_error = 0.0f;
 
+                m->pid_integral   = 0.0f;
+                m->pid_prev_error = m->fb_pos;
+                m->pid_active     = 0;
                 m->enable_pending = 0;
                 m->enabled = 1;
             }
@@ -583,30 +607,47 @@ int main(void)
             else
                 cmd_pos[i] = target;
 
-            // Outer PID loop (runs only once feedback is available)
-            if (m->fb_received) {
-                float t_lim = (m->type == MOTOR_TYPE_AK60) ? AK60_T_MAX :
-                              (m->type == MOTOR_TYPE_AK40) ? AK40_T_MAX : AK70_T_MAX;
+            // Clamp torque to motor limits
+            float t_max;
+            if (m->type == MOTOR_TYPE_AK60)
+                t_max = AK60_T_MAX;
+            else if (m->type == MOTOR_TYPE_AK40)
+                t_max = AK40_T_MAX;
+            else
+                t_max = AK70_T_MAX;
 
-                float err   = cmd_pos[i] - m->fb_pos;
-                float deriv = (err - m->pid_prev_error) / LOOP_DT;
+            float tff_pid = 0.0f;
+            if (m->pid_active) {
+                float pid_error = cmd_pos[i] - m->fb_pos;
 
-                m->pid_integral += err * LOOP_DT;
-                // Anti-windup: clamp integral contribution to half torque limit
-                float i_clamp = (m->pid_ki > 0.001f) ? (t_lim * 0.5f / m->pid_ki) : 1e6f;
-                if (m->pid_integral >  i_clamp) m->pid_integral =  i_clamp;
-                if (m->pid_integral < -i_clamp) m->pid_integral = -i_clamp;
-
-                float tff = m->pid_kp * err + m->pid_kd * deriv + m->pid_ki * m->pid_integral;
-                if (tff >  t_lim) tff =  t_lim;
-                if (tff < -t_lim) tff = -t_lim;
-                m->tff = tff;
-                m->pid_prev_error = err;
+                // Safety clamp: if error exceeds 1 rad (~57 deg), kill outer PID
+                // and let the inner MIT spring handle recovery alone
+                if (pid_error > 1.0f || pid_error < -1.0f) {
+                    m->pid_active = 0;
+                    m->pid_integral = 0.0f;
+                    m->tff = 0.0f;
+                } else {
+                    float dfb = (m->fb_pos - m->pid_prev_error) / LOOP_DT;
+                    m->pid_prev_error = m->fb_pos;
+                    m->pid_integral += pid_error * LOOP_DT;
+                    float i_max = (m->pid_ki > 0.001f) ? (t_max / m->pid_ki) : 0.0f;
+                    if (m->pid_integral > i_max) m->pid_integral = i_max;
+                    if (m->pid_integral < -i_max) m->pid_integral = -i_max;
+                    tff_pid = m->pid_kp * pid_error
+                            - m->pid_kd * dfb
+                            + m->pid_ki * m->pid_integral;
+                    if (tff_pid > t_max) tff_pid = t_max;
+                    if (tff_pid < -t_max) tff_pid = -t_max;
+                }
             }
 
-            // Send CAN frame with rate-limited position and PID-computed tff
+            // Send CAN frame with rate-limited position and PID torque
             float saved_pos = m->pos;
+            float saved_tff = m->tff;
             m->pos = cmd_pos[i];
+            m->tff = tff_pid + saved_tff;
+            if (m->tff > t_max) m->tff = t_max;
+            if (m->tff < -t_max) m->tff = -t_max;
 
             if (m->type == MOTOR_TYPE_AK60)
                 send_ak60_cmd(m);
@@ -616,6 +657,7 @@ int main(void)
                 send_ak70_cmd(m);
 
             m->pos = saved_pos;
+            m->tff = saved_tff;
             HAL_Delay(2);
         }
 

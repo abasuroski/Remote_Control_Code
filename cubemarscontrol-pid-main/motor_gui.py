@@ -28,6 +28,8 @@ Usage:
   python motor_gui.py
 """
 
+import math
+import re
 import tkinter as tk
 from tkinter import ttk
 import serial
@@ -36,37 +38,69 @@ import threading
 from datetime import datetime
 
 
+AK60_LIMIT_DEG = 45.0
+
+# All angular params (P, V) use degrees in the GUI; converted to rad before sending
+ANGULAR_CMDS = {"P", "V"}
+
 AK60_PARAMS = {
-    "Position (rad)": ("P", -12.56, 12.56, 0.0),
-    "Velocity (rad/s)": ("V", -60.0, 60.0, 0.0),
+    "Position (deg)": ("P", math.degrees(-12.56), math.degrees(12.56), 0.0),
+    "Velocity (deg/s)": ("V", math.degrees(-60.0), math.degrees(60.0), 0.0),
     "Kp": ("K", 0.0, 500.0, 2.0),
     "Kd": ("D", 0.0, 5.0, 1.0),
     "Torque FF (N·m)": ("T", -12.0, 12.0, 0.0),
 }
 
 AK70_PARAMS = {
-    "Position (rad)": ("P", -12.5, 12.5, 0.0),
-    "Velocity (rad/s)": ("V", -30.0, 30.0, 0.0),
-    "Kp": ("K", 0.0, 500.0, 6.0),
-    "Kd": ("D", 0.0, 5.0, 0.2),
+    "Position (deg)": ("P", math.degrees(-12.5), math.degrees(12.5), 0.0),
+    "Velocity (deg/s)": ("V", math.degrees(-30.0), math.degrees(30.0), 0.0),
+    "Kp (inner)": ("K", 0.0, 500.0, 5.0),
+    "Kd (inner)": ("D", 0.0, 5.0, 0.3),
     "Torque FF (N·m)": ("T", -18.0, 18.0, 0.0),
+    "Outer Kp": ("G", 0.0, 50.0, 5.0),
+    "Outer Kd": ("H", 0.0, 20.0, 0.0),
+    "Outer Ki": ("J", 0.0, 1.0, 0.0),
 }
 
 AK40_PARAMS = {
-    "Position (rad)": ("P", -12.5, 12.5, 0.0),
-    "Velocity (rad/s)": ("V", -45.5, 45.5, 0.0),
-    "Kp": ("K", 0.0, 500.0, 6.0),
-    "Kd": ("D", 0.0, 5.0, 0.2),
+    "Position (deg)": ("P", math.degrees(-12.5), math.degrees(12.5), 0.0),
+    "Velocity (deg/s)": ("V", math.degrees(-45.5), math.degrees(45.5), 0.0),
+    "Kp (inner)": ("K", 0.0, 500.0, 5.0),
+    "Kd (inner)": ("D", 0.0, 5.0, 0.3),
     "Torque FF (N·m)": ("T", -5.0, 5.0, 0.0),
+    "Outer Kp": ("G", 0.0, 50.0, 4.0),
+    "Outer Kd": ("H", 0.0, 20.0, 0.0),
+    "Outer Ki": ("J", 0.0, 1.0, 0.0),
 }
 
 
+def convert_rad_feedback(line):
+    """Convert pos/vel rad values in AK70/AK40 feedback lines to degrees."""
+    if " rad" not in line:
+        return line
+    line = re.sub(
+        r'pos=(-?\d+\.?\d*) rad',
+        lambda m: f"pos={math.degrees(float(m.group(1))):.1f} deg",
+        line
+    )
+    line = re.sub(
+        r'vel=(-?\d+\.?\d*)',
+        lambda m: f"vel={math.degrees(float(m.group(1))):.1f} deg/s",
+        line
+    )
+    return line
+
+
 class MotorPanel:
-    def __init__(self, parent, motor_idx, label, motor_type, can_id, send_fn):
+    def __init__(self, parent, motor_idx, label, motor_type, can_id, send_fn,
+                 pos_min=None, pos_max=None):
         self.motor_idx = motor_idx
         self.send_fn = send_fn
         self.sliders = {}
         self.slider_widgets = {}
+        self.ak60_home = 0.0
+        self.pos_min = pos_min
+        self.pos_max = pos_max
 
         self.frame = ttk.LabelFrame(parent, text=label)
         self.frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
@@ -95,6 +129,8 @@ class MotorPanel:
         self.enable_btn = ttk.Button(self.enable_frame, text="Enable Motor", command=self.send_enable)
         self.enable_btn.pack(side="left")
         ttk.Button(self.enable_frame, text="Set Origin", command=self.send_set_origin).pack(side="left", padx=(6, 0))
+        self.limit_label = ttk.Label(self.enable_frame, text="", font=("Consolas", 8), foreground="blue")
+        self.fixed_limit_label = ttk.Label(self.enable_frame, text="", font=("Consolas", 8), foreground="red")
 
         # --- Sliders frame ---
         self.slider_frame = ttk.LabelFrame(self.frame, text="Parameters")
@@ -122,11 +158,23 @@ class MotorPanel:
 
         t = self.type_var.get()
         if "70" in t:
-            params = AK70_PARAMS
+            params = dict(AK70_PARAMS)
         elif "40" in t:
-            params = AK40_PARAMS
+            params = dict(AK40_PARAMS)
         else:
-            params = AK60_PARAMS
+            lo = self.ak60_home - AK60_LIMIT_DEG
+            hi = self.ak60_home + AK60_LIMIT_DEG
+            params = dict(AK60_PARAMS)
+            params["Position (deg)"] = ("P", lo, hi, self.ak60_home)
+
+        if self.pos_min is not None or self.pos_max is not None:
+            cmd, lo, hi, default = params["Position (deg)"]
+            if self.pos_min is not None:
+                lo = self.pos_min
+            if self.pos_max is not None:
+                hi = self.pos_max
+            default = max(lo, min(hi, default))
+            params["Position (deg)"] = (cmd, lo, hi, default)
 
         for i, (label, (cmd, lo, hi, default)) in enumerate(params.items()):
             ttk.Label(self.slider_frame, text=label).grid(row=i, column=0, sticky="w", padx=3, pady=1)
@@ -142,6 +190,7 @@ class MotorPanel:
             self.sliders[cmd] = var
 
     def on_type_change(self, event=None):
+        self.ak60_home = 0.0
         self.build_sliders()
         self.update_enable_visibility()
         t = self.type_var.get()
@@ -154,6 +203,21 @@ class MotorPanel:
         self.send_fn(f"{self.motor_idx}A{code}\n")
 
     def update_enable_visibility(self):
+        t = self.type_var.get()
+        if "60" in t:
+            lo = self.ak60_home - AK60_LIMIT_DEG
+            hi = self.ak60_home + AK60_LIMIT_DEG
+            self.limit_label.config(text=f"  [{lo:.1f}, {hi:.1f}] deg")
+            self.limit_label.pack(side="left", padx=(4, 0))
+        else:
+            self.limit_label.pack_forget()
+        if self.pos_min is not None or self.pos_max is not None:
+            lo_txt = f"{self.pos_min:.1f}" if self.pos_min is not None else "-∞"
+            hi_txt = f"{self.pos_max:.1f}" if self.pos_max is not None else "+∞"
+            self.fixed_limit_label.config(text=f"  lim [{lo_txt}, {hi_txt}] deg")
+            self.fixed_limit_label.pack(side="left", padx=(4, 0))
+        else:
+            self.fixed_limit_label.pack_forget()
         self.enable_btn.pack(side="left")
 
     def send_canid(self):
@@ -164,14 +228,36 @@ class MotorPanel:
 
     def send_set_origin(self):
         self.send_fn(f"{self.motor_idx}O\n")
+        t = self.type_var.get()
+        if "60" in t:
+            self.ak60_home = 0.0
+            self.build_sliders()
+            lo = self.ak60_home - AK60_LIMIT_DEG
+            hi = self.ak60_home + AK60_LIMIT_DEG
+            self.limit_label.config(text=f"  [{lo:.1f}, {hi:.1f}] deg")
 
     def send_all_params(self):
         import time
+        t = self.type_var.get()
         for cmd, var in self.sliders.items():
-            self.send_fn(f"{self.motor_idx}{cmd}{var.get():.4f}\n")
+            val = var.get()
+            if "60" in t and cmd == "P":
+                lo = self.ak60_home - AK60_LIMIT_DEG
+                hi = self.ak60_home + AK60_LIMIT_DEG
+                val = max(lo, min(hi, val))
+                var.set(val)
+            if cmd == "P" and (self.pos_min is not None or self.pos_max is not None):
+                lo = self.pos_min if self.pos_min is not None else -math.inf
+                hi = self.pos_max if self.pos_max is not None else math.inf
+                val = max(lo, min(hi, val))
+                var.set(val)
+            if cmd in ANGULAR_CMDS:
+                val = math.radians(val)
+            self.send_fn(f"{self.motor_idx}{cmd}{val:.4f}\n")
             time.sleep(0.005)
 
     def append_feedback(self, line):
+        line = convert_rad_feedback(line)
         self.feedback_text.config(state="normal")
         self.feedback_text.insert("end", line + "\n")
         self.feedback_text.see("end")
@@ -385,13 +471,15 @@ class RobotArmGUI:
 
         self.panels = []
         motor_configs = [
-            (1, "Base", "AK60", 104),
-            (2, "Shoulder", "AK70/80", 1),
-            (3, "Elbow", "AK70/80", 2),
-            (4, "Linkage", "AK40", 3),
+            dict(idx=1, label="Base",     mtype="AK60",    cid=104),
+            dict(idx=2, label="Shoulder", mtype="AK70/80", cid=2,  pos_min=-90.0, pos_max=0.0),
+            dict(idx=3, label="Elbow",    mtype="AK70/80", cid=1,  pos_min=0.0, pos_max=math.degrees(0.4)),
+            dict(idx=4, label="Linkage",  mtype="AK40",    cid=3,  pos_min=0.0, pos_max=math.degrees(1.782)),
         ]
-        for idx, label, mtype, cid in motor_configs:
-            panel = MotorPanel(body_frame, idx, label, mtype, cid, self.send_cmd)
+        for cfg in motor_configs:
+            panel = MotorPanel(body_frame, cfg["idx"], cfg["label"], cfg["mtype"], cfg["cid"],
+                               self.send_cmd,
+                               pos_min=cfg.get("pos_min"), pos_max=cfg.get("pos_max"))
             self.panels.append(panel)
 
         # === End Effector Tab ===

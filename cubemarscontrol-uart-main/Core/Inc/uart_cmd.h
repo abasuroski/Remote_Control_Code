@@ -25,6 +25,7 @@ typedef struct {
     uint8_t set_origin_pending;
     volatile float fb_pos;
     volatile uint8_t fb_received;
+    float pos_offset;
 } MotorState;
 
 void         uart_cmd_init(void);

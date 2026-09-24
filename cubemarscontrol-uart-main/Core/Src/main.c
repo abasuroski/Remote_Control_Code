@@ -182,7 +182,7 @@ static void send_ak60_cmd(MotorState *m)
 {
     uint16_t kp_int = float_to_uint(m->kp,  KP_MIN, KP_MAX, 12);
     uint16_t kd_int = float_to_uint(m->kd,  KD_MIN, KD_MAX, 12);
-    uint16_t p_int  = float_to_uint(m->pos, AK60_P_MIN, AK60_P_MAX, 16);
+    uint16_t p_int  = float_to_uint(m->pos + m->pos_offset, AK60_P_MIN, AK60_P_MAX, 16);
     uint16_t v_int  = float_to_uint(m->vel, AK60_V_MIN, AK60_V_MAX, 12);
     uint16_t t_int  = float_to_uint(m->tff, AK60_T_MIN, AK60_T_MAX, 12);
 
@@ -279,11 +279,10 @@ static void send_ak70_enable(MotorState *m)
     send_can_frame();
 }
 
-// AK60 set origin: servo mode, extended frame, CAN_PACKET_SET_ORIGIN_HERE (id=5)
-// Data[0]=0 → temporary (cleared on power loss); Data[0]=1 → permanent
+// AK60 set origin: mode 0x05, data[0]=0x01 (temporary) per CANOriginMode definition
 static void send_ak60_set_origin(MotorState *m)
 {
-    txData[0] = 0x00;
+    txData[0] = 0x02;
 
     txHeader.StdId              = 0;
     txHeader.ExtId              = (uint32_t)m->can_id | ((uint32_t)5 << 8);
@@ -329,13 +328,13 @@ static void unpack_ak60_reply(uint8_t motor_idx)
     int8_t err  = (int8_t)rxData[7];
 
     MotorState *m = uart_cmd_motor(motor_idx);
-    m->fb_pos = pos * 0.01745329f;
+    m->fb_pos = pos * 0.01745329f - m->pos_offset;
     m->fb_received = 1;
 
     char buf[96];
     int len = snprintf(buf, sizeof(buf),
         "[M%d] pos=%.1f deg  spd=%.0f eRPM  I=%.2f A  T=%d  err=%d\r\n",
-        motor_idx + 1, (double)pos, (double)spd, (double)cur, temp, err);
+        motor_idx + 1, (double)(m->fb_pos / 0.01745329f), (double)spd, (double)cur, temp, err);
     fb_write(buf, len);
 }
 
@@ -471,10 +470,12 @@ int main(void)
 
             // Handle set origin
             if (m->set_origin_pending) {
-                if (m->type == MOTOR_TYPE_AK60)
+                if (m->type == MOTOR_TYPE_AK60) {
+                    m->pos_offset += m->fb_pos;
                     send_ak60_set_origin(m);
-                else
+                } else {
                     send_ak70_set_origin(m);
+                }
                 HAL_Delay(10);
                 m->pos = 0.0f;
                 cmd_pos[i] = 0.0f;

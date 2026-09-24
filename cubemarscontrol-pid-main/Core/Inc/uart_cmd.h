@@ -25,12 +25,14 @@ typedef struct {
     uint8_t set_origin_pending;
     volatile float fb_pos;
     volatile uint8_t fb_received;
+    float pos_offset;
     // Outer STM32 PID (set via G/H/J commands)
     float pid_kp;
     float pid_kd;
     float pid_ki;
     float pid_integral;
     float pid_prev_error;
+    uint8_t pid_active;
 } MotorState;
 
 void         uart_cmd_init(void);

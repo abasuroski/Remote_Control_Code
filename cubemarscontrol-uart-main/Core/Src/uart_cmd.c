@@ -22,6 +22,7 @@ void uart_cmd_init(void)
     motors[0].enable_pending = 0;
     motors[0].enabled = 0;
     motors[0].set_origin_pending = 0;
+    motors[0].pos_offset = 0.0f;
 
     // Motor 2: AK70, CAN ID 1 (needs enable)
     motors[1].pos = 0.0f;

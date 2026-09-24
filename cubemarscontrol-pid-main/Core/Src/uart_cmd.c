@@ -26,11 +26,13 @@ void uart_cmd_init(void)
     motors[0].enable_pending = 0;
     motors[0].enabled = 0;
     motors[0].set_origin_pending = 0;
+    motors[0].pos_offset = 0.0f;
     motors[0].pid_kp = 25.0f;
-    motors[0].pid_kd = 2.0f;
+    motors[0].pid_kd = 0.0f;
     motors[0].pid_ki = 0.3f;
     motors[0].pid_integral = 0.0f;
     motors[0].pid_prev_error = 0.0f;
+    motors[0].pid_active = 0;
 
     // Motor 2: AK70, CAN ID 1 (needs enable)
     motors[1].pos = 0.0f;
@@ -38,14 +40,14 @@ void uart_cmd_init(void)
     motors[1].kp  = 5.0f;    // inner MIT spring
     motors[1].kd  = 0.3f;    // inner MIT damper
     motors[1].tff = 0.0f;
-    motors[1].can_id = 1;
+    motors[1].can_id = 2;
     motors[1].type = MOTOR_TYPE_AK70;
     motors[1].enable_pending = 0;
     motors[1].enabled = 0;
     motors[1].set_origin_pending = 0;
-    motors[1].pid_kp = 40.0f;
-    motors[1].pid_kd = 3.0f;
-    motors[1].pid_ki = 0.5f;
+    motors[1].pid_kp = 5.0f;
+    motors[1].pid_kd = 0.0f;
+    motors[1].pid_ki = 0.0f;    // no integral; inner kp handles steady-state gravity error
     motors[1].pid_integral = 0.0f;
     motors[1].pid_prev_error = 0.0f;
 
@@ -55,14 +57,14 @@ void uart_cmd_init(void)
     motors[2].kp  = 5.0f;    // inner MIT spring
     motors[2].kd  = 0.3f;    // inner MIT damper
     motors[2].tff = 0.0f;
-    motors[2].can_id = 2;
+    motors[2].can_id = 1;
     motors[2].type = MOTOR_TYPE_AK70;
     motors[2].enable_pending = 0;
     motors[2].enabled = 0;
     motors[2].set_origin_pending = 0;
-    motors[2].pid_kp = 40.0f;
-    motors[2].pid_kd = 3.0f;
-    motors[2].pid_ki = 0.5f;
+    motors[2].pid_kp = 5.0f;
+    motors[2].pid_kd = 0.0f;
+    motors[2].pid_ki = 0.0f;
     motors[2].pid_integral = 0.0f;
     motors[2].pid_prev_error = 0.0f;
 
@@ -77,9 +79,9 @@ void uart_cmd_init(void)
     motors[3].enable_pending = 0;
     motors[3].enabled = 0;
     motors[3].set_origin_pending = 0;
-    motors[3].pid_kp = 25.0f;
-    motors[3].pid_kd = 2.0f;
-    motors[3].pid_ki = 0.3f;
+    motors[3].pid_kp = 4.0f;
+    motors[3].pid_kd = 0.0f;
+    motors[3].pid_ki = 0.0f;
     motors[3].pid_integral = 0.0f;
     motors[3].pid_prev_error = 0.0f;
 
@@ -130,7 +132,8 @@ static void parse_cmd(void)
         case 'P': case 'p':
             m->pos = val;
             m->pid_integral = 0.0f;
-            m->pid_prev_error = 0.0f;
+            m->pid_prev_error = m->fb_pos;
+            m->pid_active = 1;
             break;
         case 'V': case 'v': m->vel = val; break;
         case 'K': case 'k': m->kp  = val; break;  // inner MIT spring gain
