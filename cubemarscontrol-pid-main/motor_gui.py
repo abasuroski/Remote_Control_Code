@@ -30,6 +30,7 @@ Usage:
 
 import math
 import re
+import time
 import tkinter as tk
 from tkinter import ttk
 import serial
@@ -91,6 +92,28 @@ def convert_rad_feedback(line):
     return line
 
 
+def cosine_interp(t, duration, start, end):
+    """Cosine interpolation: zero velocity at both endpoints, smooth acceleration.
+    Returns (position, velocity) in the same units as start/end."""
+    s = t / duration
+    pos = start + (end - start) * (1.0 - math.cos(math.pi * s)) / 2.0
+    vel = (end - start) * math.pi / (2.0 * duration) * math.sin(math.pi * s)
+    return pos, vel
+
+
+DEMO_SEGMENTS = [
+    {"name": "Lowering shoulder",  "duration": 5.0, "targets": {2: (0, -45)}},
+    {"name": "Pause",              "duration": 1.0, "targets": {}},
+    {"name": "Sweep right",        "duration": 5.0, "targets": {1: (0, 90)}},
+    {"name": "Pause",              "duration": 1.0, "targets": {}},
+    {"name": "Sweep left",         "duration": 6.0, "targets": {1: (90, -90)}},
+    {"name": "Pause",              "duration": 1.0, "targets": {}},
+    {"name": "Return base",        "duration": 4.0, "targets": {1: (-90, 0)}},
+    {"name": "Pause",              "duration": 1.0, "targets": {}},
+    {"name": "Raising shoulder",   "duration": 4.0, "targets": {2: (-45, 0)}},
+]
+
+
 class MotorPanel:
     def __init__(self, parent, motor_idx, label, motor_type, can_id, send_fn,
                  pos_min=None, pos_max=None):
@@ -128,7 +151,8 @@ class MotorPanel:
         self.enable_frame.pack(fill="x", padx=5, pady=2)
         self.enable_btn = ttk.Button(self.enable_frame, text="Enable Motor", command=self.send_enable)
         self.enable_btn.pack(side="left")
-        ttk.Button(self.enable_frame, text="Set Origin", command=self.send_set_origin).pack(side="left", padx=(6, 0))
+        self.origin_btn = ttk.Button(self.enable_frame, text="Set Origin", command=self.send_set_origin)
+        self.origin_btn.pack(side="left", padx=(6, 0))
         self.limit_label = ttk.Label(self.enable_frame, text="", font=("Consolas", 8), foreground="blue")
         self.fixed_limit_label = ttk.Label(self.enable_frame, text="", font=("Consolas", 8), foreground="red")
 
@@ -139,7 +163,8 @@ class MotorPanel:
         self.build_sliders()
 
         # --- GO button ---
-        ttk.Button(self.frame, text="GO", command=self.send_all_params).pack(fill="x", padx=5, pady=5, ipady=6)
+        self.go_btn = ttk.Button(self.frame, text="GO", command=self.send_all_params)
+        self.go_btn.pack(fill="x", padx=5, pady=5, ipady=6)
 
         # --- Feedback ---
         fb_frame = ttk.LabelFrame(self.frame, text="Feedback")
@@ -325,7 +350,8 @@ class WristDifferentialPanel:
                    command=lambda: self.set_preset(0, -60)).pack(side="left", padx=2)
 
         # --- GO button ---
-        ttk.Button(self.frame, text="GO", command=self.send_position).pack(fill="x", padx=5, pady=5, ipady=6)
+        self.go_btn = ttk.Button(self.frame, text="GO", command=self.send_position)
+        self.go_btn.pack(fill="x", padx=5, pady=5, ipady=6)
 
         # --- Feedback ---
         fb_frame = ttk.LabelFrame(self.frame, text="Feedback")
@@ -397,7 +423,8 @@ class ServoPanel:
                        command=lambda a=angle: self.set_angle(a)).pack(side="left", padx=2)
 
         # --- GO button ---
-        ttk.Button(self.frame, text="GO", command=self.send_position).pack(fill="x", padx=5, pady=5, ipady=6)
+        self.go_btn = ttk.Button(self.frame, text="GO", command=self.send_position)
+        self.go_btn.pack(fill="x", padx=5, pady=5, ipady=6)
 
         # --- Feedback ---
         fb_frame = ttk.LabelFrame(self.frame, text="Feedback")
@@ -461,6 +488,35 @@ class RobotArmGUI:
 
         self.log_file = None
 
+        # --- Demo frame ---
+        demo_frame = ttk.LabelFrame(root, text="Demo Sequence")
+        demo_frame.pack(fill="x", padx=10, pady=5)
+
+        self.demo_run_btn = ttk.Button(demo_frame, text="Run Demo", command=self.start_demo)
+        self.demo_run_btn.pack(side="left", padx=5, pady=5)
+
+        self.demo_abort_btn = ttk.Button(demo_frame, text="Abort", command=self.abort_demo, state="disabled")
+        self.demo_abort_btn.pack(side="left", padx=5, pady=5)
+
+        ttk.Label(demo_frame, text="Speed:").pack(side="left", padx=(10, 2))
+        self.demo_speed_var = tk.DoubleVar(value=1.0)
+        self.demo_speed_scale = ttk.Scale(demo_frame, from_=0.25, to=2.0,
+                                          variable=self.demo_speed_var,
+                                          orient="horizontal", length=100)
+        self.demo_speed_scale.pack(side="left", padx=2)
+        self.demo_speed_label = ttk.Label(demo_frame, text="1.00x", width=5)
+        self.demo_speed_label.pack(side="left")
+        self.demo_speed_var.trace_add("write", lambda *_: self.demo_speed_label.config(
+            text=f"{self.demo_speed_var.get():.2f}x"))
+
+        self.demo_status_label = ttk.Label(demo_frame, text="Ready", font=("Consolas", 9))
+        self.demo_status_label.pack(side="left", padx=15)
+
+        self.demo_abort = False
+        self.demo_thread = None
+        self.demo_last_pos = {}
+        self.motor_fb_pos = {1: None, 2: None, 3: None, 4: None}
+
         # --- Tabbed notebook ---
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
@@ -493,7 +549,8 @@ class RobotArmGUI:
         self.servo_panels = [self.wrist_panel, self.wrist_panel, self.gripper_panel]
 
         # --- GO ALL servos button ---
-        ttk.Button(ee_frame, text="GO ALL", command=self.send_all_servos).pack(fill="x", padx=10, pady=5, ipady=6)
+        self.go_all_btn = ttk.Button(ee_frame, text="GO ALL", command=self.send_all_servos)
+        self.go_all_btn.pack(fill="x", padx=10, pady=5, ipady=6)
 
         # --- Serial reader ---
         self.running = True
@@ -502,8 +559,286 @@ class RobotArmGUI:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    def _set_controls_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for panel in self.panels:
+            panel.go_btn.config(state=state)
+            panel.enable_btn.config(state=state)
+            panel.origin_btn.config(state=state)
+        self.wrist_panel.go_btn.config(state=state)
+        self.gripper_panel.go_btn.config(state=state)
+        self.go_all_btn.config(state=state)
+
+    def _demo_set_status(self, text):
+        self.root.after(0, self.demo_status_label.config, {"text": text})
+
+    def start_demo(self):
+        if not self.ser or not self.ser.is_open:
+            self.demo_status_label.config(text="Not connected!")
+            return
+        self.demo_abort = False
+        self.demo_run_btn.config(state="disabled")
+        self.demo_abort_btn.config(state="normal")
+        self.demo_speed_scale.config(state="disabled")
+        self._set_controls_enabled(False)
+        self.demo_last_pos = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+        self.demo_thread = threading.Thread(target=self._demo_thread, daemon=True)
+        self.demo_thread.start()
+
+    def abort_demo(self):
+        self.demo_abort = True
+
+    def _demo_finish(self, status_text):
+        self.root.after(0, self._set_controls_enabled, True)
+        self.root.after(0, self.demo_run_btn.config, {"state": "normal"})
+        self.root.after(0, self.demo_abort_btn.config, {"state": "disabled"})
+        self.root.after(0, self.demo_speed_scale.config, {"state": "normal"})
+        self._demo_set_status(status_text)
+
+    def _demo_send(self, cmd):
+        if self.ser and self.ser.is_open:
+            self.ser.write(cmd.encode())
+
+    def _demo_thread(self):
+        speed = self.demo_speed_var.get()
+        if speed < 0.1:
+            speed = 0.1
+
+        KP_START = 1.0
+        KP_STEP = 0.5
+        KP_MAX = 50.0
+        KD_DEMO = 0.5
+        MOVE_THRESHOLD = math.radians(0.5)  # 0.5 deg
+        PROBE_OFFSET = math.radians(5.0)    # 5 deg nudge
+        PROBE_SETTLE = 0.2                   # seconds between Kp bumps
+        KP_MARGIN = 5.0
+
+        saved_gains = {}
+        demo_kp = {}
+        try:
+            # --- Phase 1: Save gains, zero outer PID ---
+            self._demo_set_status("Preparing gains...")
+            for motor in [1, 2, 3, 4]:
+                panel = self.panels[motor - 1]
+                saved_gains[motor] = {}
+                for cmd in ["K", "D", "G", "H", "J"]:
+                    if cmd in panel.sliders:
+                        saved_gains[motor][cmd] = panel.sliders[cmd].get()
+                # Zero outer PID
+                for cmd in ["G", "H", "J"]:
+                    self._demo_send(f"{motor}{cmd}0.0\n")
+                    time.sleep(0.005)
+                # Set Kd for demo
+                self._demo_send(f"{motor}D{KD_DEMO:.4f}\n")
+                time.sleep(0.005)
+            time.sleep(0.1)
+
+            if self.demo_abort:
+                return
+
+            # --- Phase 1b: Enable motors ---
+            self._demo_set_status("Enabling motors...")
+            for motor in [1, 2, 3, 4]:
+                if self.demo_abort:
+                    return
+                self._demo_set_status(f"Enabling motor {motor}...")
+                self._demo_send(f"{motor}E\n")
+                self._demo_wait(2.0)
+
+            if self.demo_abort:
+                return
+
+            # --- Phase 2: Zero positions ---
+            self._demo_set_status("Zeroing positions...")
+            for motor in [1, 2, 3, 4]:
+                if self.demo_abort:
+                    return
+                self._demo_send(f"{motor}O\n")
+                time.sleep(0.2)
+
+            for motor in [1, 2, 3, 4]:
+                self._demo_send(f"{motor}P0.0\n")
+                time.sleep(0.005)
+                self._demo_send(f"{motor}V0.0\n")
+                time.sleep(0.005)
+            self.demo_last_pos = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+            self._demo_wait(1.0)
+
+            if self.demo_abort:
+                return
+
+            # --- Phase 2b: Auto-tune Kp for each motor that moves ---
+            # Figure out which motors actually move in the demo
+            motors_that_move = set()
+            for seg in DEMO_SEGMENTS:
+                motors_that_move.update(seg["targets"].keys())
+
+            for motor in sorted(motors_that_move):
+                if self.demo_abort:
+                    return
+                self._demo_set_status(f"Tuning motor {motor}...")
+
+                # Record baseline position from feedback
+                self.motor_fb_pos[motor] = None
+                self._demo_send(f"{motor}K{KP_START:.4f}\n")
+                time.sleep(0.005)
+                self._demo_wait(0.3)
+                baseline = self.motor_fb_pos[motor]
+
+                if baseline is None:
+                    # No feedback — use a safe default
+                    demo_kp[motor] = 20.0
+                    self._demo_set_status(f"Motor {motor}: no feedback, using Kp={demo_kp[motor]:.0f}")
+                    self._demo_wait(0.5)
+                    continue
+
+                # Send a small position offset to test if the motor can move
+                # Use the direction of the motor's first move in the demo
+                first_dir = 1.0
+                for seg in DEMO_SEGMENTS:
+                    if motor in seg["targets"]:
+                        _, end_deg = seg["targets"][motor]
+                        first_dir = 1.0 if end_deg > 0 else -1.0
+                        break
+                probe_target = first_dir * PROBE_OFFSET
+
+                self._demo_send(f"{motor}P{probe_target:.4f}\n")
+                time.sleep(0.005)
+
+                # Ramp Kp until we see movement
+                kp = KP_START
+                found = False
+                while kp <= KP_MAX and not self.demo_abort:
+                    self._demo_send(f"{motor}K{kp:.4f}\n")
+                    time.sleep(0.005)
+                    self._demo_wait(PROBE_SETTLE)
+
+                    current = self.motor_fb_pos[motor]
+                    if current is not None and abs(current - baseline) > MOVE_THRESHOLD:
+                        demo_kp[motor] = min(kp + KP_MARGIN, KP_MAX)
+                        found = True
+                        break
+                    kp += KP_STEP
+
+                if not found:
+                    demo_kp[motor] = KP_MAX
+
+                self._demo_set_status(f"Motor {motor}: Kp={demo_kp[motor]:.0f}")
+
+                # Return to zero
+                self._demo_send(f"{motor}P0.0\n")
+                time.sleep(0.005)
+                self._demo_send(f"{motor}K{demo_kp[motor]:.4f}\n")
+                time.sleep(0.005)
+                self._demo_wait(0.5)
+
+            # Set final tuned Kp for motors that don't move (hold position)
+            for motor in [1, 2, 3, 4]:
+                if motor not in demo_kp:
+                    demo_kp[motor] = 15.0
+                self._demo_send(f"{motor}K{demo_kp[motor]:.4f}\n")
+                time.sleep(0.005)
+
+            self._demo_set_status("Tuning complete")
+            self._demo_wait(0.5)
+
+            if self.demo_abort:
+                return
+
+            # --- Phase 3: Run demo segments ---
+            for seg in DEMO_SEGMENTS:
+                if self.demo_abort:
+                    return
+                name = seg["name"]
+                duration = seg["duration"] / speed
+                targets = seg["targets"]
+
+                if not targets:
+                    self._demo_set_status(f"Pause...")
+                    self._demo_wait(duration)
+                else:
+                    self._demo_set_status(name)
+                    self._run_segment(targets, duration)
+
+            if self.demo_abort:
+                return
+
+            # --- Phase 4: Settle ---
+            self._demo_set_status("Settling...")
+            for motor in [1, 2, 3, 4]:
+                self._demo_send(f"{motor}P0.0\n")
+                time.sleep(0.005)
+                self._demo_send(f"{motor}V0.0\n")
+                time.sleep(0.005)
+            self.demo_last_pos = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+            self._demo_wait(1.0)
+
+            self._demo_finish("Demo complete")
+
+        except Exception as e:
+            self._demo_finish(f"Error: {e}")
+        finally:
+            # Restore all saved gains (inner Kp/Kd + outer PID)
+            for motor, gains in saved_gains.items():
+                for cmd, val in gains.items():
+                    self._demo_send(f"{motor}{cmd}{val:.4f}\n")
+                    time.sleep(0.005)
+            if self.demo_abort:
+                # Emergency stop: zero velocity, hold position
+                for motor in [1, 2, 3, 4]:
+                    self._demo_send(f"{motor}V0.0\n")
+                    time.sleep(0.003)
+                for motor in [1, 2, 3, 4]:
+                    pos = self.demo_last_pos.get(motor, 0.0)
+                    self._demo_send(f"{motor}P{pos:.4f}\n")
+                    time.sleep(0.003)
+                self._demo_finish("Aborted")
+
+    def _demo_wait(self, duration):
+        t0 = time.perf_counter()
+        while not self.demo_abort:
+            if time.perf_counter() - t0 >= duration:
+                break
+            time.sleep(0.020)
+
+    def _run_segment(self, targets, duration):
+        """Run a cosine-interpolated motion segment.
+        targets: {motor_num: (start_deg, end_deg)}"""
+        DT = 0.020
+        t0 = time.perf_counter()
+        next_tick = t0
+
+        targets_rad = {}
+        for motor, (start_deg, end_deg) in targets.items():
+            targets_rad[motor] = (math.radians(start_deg), math.radians(end_deg))
+
+        while not self.demo_abort:
+            elapsed = time.perf_counter() - t0
+            if elapsed >= duration:
+                break
+
+            for motor, (start_rad, end_rad) in targets_rad.items():
+                pos, vel = cosine_interp(elapsed, duration, start_rad, end_rad)
+                self._demo_send(f"{motor}P{pos:.4f}\n")
+                time.sleep(0.003)
+                self._demo_send(f"{motor}V{vel:.4f}\n")
+                time.sleep(0.003)
+                self.demo_last_pos[motor] = pos
+
+            next_tick += DT
+            sleep_time = next_tick - time.perf_counter()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        # Send final position with zero velocity
+        for motor, (start_rad, end_rad) in targets_rad.items():
+            self._demo_send(f"{motor}P{end_rad:.4f}\n")
+            time.sleep(0.003)
+            self._demo_send(f"{motor}V0.0\n")
+            time.sleep(0.003)
+            self.demo_last_pos[motor] = end_rad
+
     def send_all_servos(self):
-        import time
         self.wrist_panel.send_position()
         time.sleep(0.005)
         self.gripper_panel.send_position()
@@ -521,6 +856,10 @@ class RobotArmGUI:
                 return
             try:
                 self.ser = serial.Serial(port, 115200, timeout=0.1)
+                time.sleep(0.05)
+                # Freeze motors at current position to prevent stale commands
+                # from a previous session causing unexpected motion
+                self.ser.write(b"0X\n")
                 self.connect_btn.config(text="Disconnect")
                 self.status_label.config(text=f"Connected: {port}")
             except serial.SerialException as e:
@@ -566,7 +905,15 @@ class RobotArmGUI:
         for i, panel in enumerate(self.panels, start=1):
             tag = f"[M{i}]"
             if line.startswith(tag):
-                self.root.after(0, panel.append_feedback, line[len(tag):].strip())
+                body = line[len(tag):].strip()
+                self.root.after(0, panel.append_feedback, body)
+                # Parse position for demo feedback tracking
+                m = re.search(r'pos=(-?\d+\.?\d*)\s*(rad|deg)', body)
+                if m:
+                    val = float(m.group(1))
+                    if m.group(2) == "deg":
+                        val = math.radians(val)
+                    self.motor_fb_pos[i] = val
                 routed = True
                 break
         # Check servo panels [M5]-[M7]
@@ -581,7 +928,10 @@ class RobotArmGUI:
             self.root.after(0, self.panels[0].append_feedback, line)
 
     def on_close(self):
+        self.demo_abort = True
         self.running = False
+        if self.demo_thread and self.demo_thread.is_alive():
+            self.demo_thread.join(timeout=2.0)
         if self.log_file:
             self.log_file.close()
             self.log_file = None
