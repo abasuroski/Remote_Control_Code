@@ -33,6 +33,7 @@ typedef struct {
     float pid_integral;
     float pid_prev_error;
     uint8_t pid_active;
+    uint8_t fb_only;     // 1 = poll state via 0xFC, no torque (set via R command)
 } MotorState;
 
 void         uart_cmd_init(void);

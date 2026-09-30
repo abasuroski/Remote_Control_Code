@@ -33,6 +33,7 @@ void uart_cmd_init(void)
     motors[0].pid_integral = 0.0f;
     motors[0].pid_prev_error = 0.0f;
     motors[0].pid_active = 0;
+    motors[0].fb_only = 0;
 
     // Motor 2: AK70, CAN ID 1 (needs enable)
     motors[1].pos = 0.0f;
@@ -50,6 +51,7 @@ void uart_cmd_init(void)
     motors[1].pid_ki = 0.0f;    // no integral; inner kp handles steady-state gravity error
     motors[1].pid_integral = 0.0f;
     motors[1].pid_prev_error = 0.0f;
+    motors[1].fb_only = 0;
 
     // Motor 3: AK70, CAN ID 2 (needs enable)
     motors[2].pos = 0.0f;
@@ -67,6 +69,7 @@ void uart_cmd_init(void)
     motors[2].pid_ki = 0.0f;
     motors[2].pid_integral = 0.0f;
     motors[2].pid_prev_error = 0.0f;
+    motors[2].fb_only = 0;
 
     // Motor 4: AK40, CAN ID 3 (needs enable)
     motors[3].pos = 0.0f;
@@ -84,6 +87,8 @@ void uart_cmd_init(void)
     motors[3].pid_ki = 0.0f;
     motors[3].pid_integral = 0.0f;
     motors[3].pid_prev_error = 0.0f;
+    motors[3].fb_only = 0;
+
 
     idx = 0;
 }
@@ -145,7 +150,15 @@ static void parse_cmd(void)
             m->pid_ki = val;
             m->pid_integral = 0.0f;
             break;
-        case 'E': case 'e': m->enable_pending = 1; break;
+        case 'E': case 'e':
+            m->enable_pending = 1;
+            m->fb_only = 0;
+            break;
+        case 'R': case 'r':
+            m->fb_only = 1;
+            m->enabled = 0;
+            m->enable_pending = 0;
+            break;
         case 'O': case 'o': m->set_origin_pending = 1; break;
         case 'I': case 'i': m->can_id = (uint8_t)val; break;
         case 'A': case 'a':

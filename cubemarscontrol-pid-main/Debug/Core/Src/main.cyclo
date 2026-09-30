@@ -17,10 +17,10 @@
 ../Core/Src/main.c:433:6:HAL_UART_RxCpltCallback	2
 ../Core/Src/main.c:443:13:do_e_stop	4
 ../Core/Src/main.c:460:6:HAL_GPIO_EXTI_Callback	2
-../Core/Src/main.c:468:5:main	36
-../Core/Src/main.c:683:6:SystemClock_Config	3
-../Core/Src/main.c:712:13:MX_CAN1_Init	2
-../Core/Src/main.c:741:13:MX_TIM2_Init	1
-../Core/Src/main.c:788:13:MX_USART2_UART_Init	2
-../Core/Src/main.c:801:13:MX_GPIO_Init	1
-../Core/Src/main.c:824:6:Error_Handler	1
+../Core/Src/main.c:468:5:main	44
+../Core/Src/main.c:724:6:SystemClock_Config	3
+../Core/Src/main.c:753:13:MX_CAN1_Init	2
+../Core/Src/main.c:782:13:MX_TIM2_Init	1
+../Core/Src/main.c:829:13:MX_USART2_UART_Init	2
+../Core/Src/main.c:842:13:MX_GPIO_Init	1
+../Core/Src/main.c:865:6:Error_Handler	1

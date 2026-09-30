@@ -102,7 +102,7 @@ def cosine_interp(t, duration, start, end):
 
 
 DEMO_SEGMENTS = [
-    {"name": "Lowering shoulder",  "duration": 5.0, "targets": {2: (0, -45)}},
+    {"name": "Lowering shoulder",  "duration": 5.0, "targets": {2: (0, -45)}, "tff": {2: -0.3}},
     {"name": "Pause",              "duration": 1.0, "targets": {}},
     {"name": "Sweep right",        "duration": 5.0, "targets": {1: (0, 90)}},
     {"name": "Pause",              "duration": 1.0, "targets": {}},
@@ -599,24 +599,26 @@ class RobotArmGUI:
         if self.ser and self.ser.is_open:
             self.ser.write(cmd.encode())
 
+    def _demo_log(self, msg):
+        if self.log_file:
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            self.log_file.write(f"{timestamp}  [DEMO] {msg}\n")
+            self.log_file.flush()
+
     def _demo_thread(self):
         speed = self.demo_speed_var.get()
         if speed < 0.1:
             speed = 0.1
 
-        KP_START = 1.0
-        KP_STEP = 0.5
-        KP_MAX = 50.0
-        KD_DEMO = 0.5
-        MOVE_THRESHOLD = math.radians(0.5)  # 0.5 deg
-        PROBE_OFFSET = math.radians(5.0)    # 5 deg nudge
-        PROBE_SETTLE = 0.2                   # seconds between Kp bumps
-        KP_MARGIN = 5.0
+        # Inner Kp during demo — outer PID stays active for gravity compensation.
+        # 2× the firmware defaults gives tighter trajectory tracking.
+        DEMO_INNER_KP = {1: 3.0, 2: 5.0, 3: 5.0, 4: 5.0}
+        KD_DEMO = {1: 0.5, 2: 1.2, 3: 0.5, 4: 0.5}
 
         saved_gains = {}
-        demo_kp = {}
         try:
-            # --- Phase 1: Save gains, zero outer PID ---
+            # --- Phase 1: Save inner Kp/Kd and outer PID, apply demo gains ---
+            self._demo_log("Demo start")
             self._demo_set_status("Preparing gains...")
             for motor in [1, 2, 3, 4]:
                 panel = self.panels[motor - 1]
@@ -624,12 +626,9 @@ class RobotArmGUI:
                 for cmd in ["K", "D", "G", "H", "J"]:
                     if cmd in panel.sliders:
                         saved_gains[motor][cmd] = panel.sliders[cmd].get()
-                # Zero outer PID
-                for cmd in ["G", "H", "J"]:
-                    self._demo_send(f"{motor}{cmd}0.0\n")
-                    time.sleep(0.005)
-                # Set Kd for demo
-                self._demo_send(f"{motor}D{KD_DEMO:.4f}\n")
+                self._demo_send(f"{motor}K{DEMO_INNER_KP[motor]:.4f}\n")
+                time.sleep(0.005)
+                self._demo_send(f"{motor}D{KD_DEMO[motor]:.4f}\n")
                 time.sleep(0.005)
             time.sleep(0.1)
 
@@ -638,109 +637,47 @@ class RobotArmGUI:
 
             # --- Phase 1b: Enable motors ---
             self._demo_set_status("Enabling motors...")
+            self._demo_log("Enabling motors")
             for motor in [1, 2, 3, 4]:
                 if self.demo_abort:
                     return
                 self._demo_set_status(f"Enabling motor {motor}...")
+                self._demo_log(f"Enable M{motor}")
                 self._demo_send(f"{motor}E\n")
                 self._demo_wait(2.0)
 
             if self.demo_abort:
                 return
 
-            # --- Phase 2: Zero positions ---
-            self._demo_set_status("Zeroing positions...")
+            # --- Phase 2: Capture current positions as demo zero (no origin set) ---
+            self._demo_set_status("Reading start positions...")
+            demo_offset = {}
             for motor in [1, 2, 3, 4]:
-                if self.demo_abort:
-                    return
-                self._demo_send(f"{motor}O\n")
-                time.sleep(0.2)
+                pos = self.motor_fb_pos.get(motor)
+                demo_offset[motor] = pos if pos is not None else 0.0
+                self._demo_log(f"M{motor} start offset: {demo_offset[motor]:.4f} rad")
 
             for motor in [1, 2, 3, 4]:
-                self._demo_send(f"{motor}P0.0\n")
+                self._demo_send(f"{motor}P{demo_offset[motor]:.4f}\n")
                 time.sleep(0.005)
                 self._demo_send(f"{motor}V0.0\n")
                 time.sleep(0.005)
-            self.demo_last_pos = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
-            self._demo_wait(1.0)
+                self.demo_last_pos[motor] = demo_offset[motor]
+            self._demo_wait(0.5)
 
             if self.demo_abort:
                 return
 
-            # --- Phase 2b: Auto-tune Kp for each motor that moves ---
-            # Figure out which motors actually move in the demo
-            motors_that_move = set()
-            for seg in DEMO_SEGMENTS:
-                motors_that_move.update(seg["targets"].keys())
-
-            for motor in sorted(motors_that_move):
-                if self.demo_abort:
-                    return
-                self._demo_set_status(f"Tuning motor {motor}...")
-
-                # Record baseline position from feedback
-                self.motor_fb_pos[motor] = None
-                self._demo_send(f"{motor}K{KP_START:.4f}\n")
-                time.sleep(0.005)
-                self._demo_wait(0.3)
-                baseline = self.motor_fb_pos[motor]
-
-                if baseline is None:
-                    # No feedback — use a safe default
-                    demo_kp[motor] = 20.0
-                    self._demo_set_status(f"Motor {motor}: no feedback, using Kp={demo_kp[motor]:.0f}")
-                    self._demo_wait(0.5)
-                    continue
-
-                # Send a small position offset to test if the motor can move
-                # Use the direction of the motor's first move in the demo
-                first_dir = 1.0
-                for seg in DEMO_SEGMENTS:
-                    if motor in seg["targets"]:
-                        _, end_deg = seg["targets"][motor]
-                        first_dir = 1.0 if end_deg > 0 else -1.0
-                        break
-                probe_target = first_dir * PROBE_OFFSET
-
-                self._demo_send(f"{motor}P{probe_target:.4f}\n")
-                time.sleep(0.005)
-
-                # Ramp Kp until we see movement
-                kp = KP_START
-                found = False
-                while kp <= KP_MAX and not self.demo_abort:
-                    self._demo_send(f"{motor}K{kp:.4f}\n")
-                    time.sleep(0.005)
-                    self._demo_wait(PROBE_SETTLE)
-
-                    current = self.motor_fb_pos[motor]
-                    if current is not None and abs(current - baseline) > MOVE_THRESHOLD:
-                        demo_kp[motor] = min(kp + KP_MARGIN, KP_MAX)
-                        found = True
-                        break
-                    kp += KP_STEP
-
-                if not found:
-                    demo_kp[motor] = KP_MAX
-
-                self._demo_set_status(f"Motor {motor}: Kp={demo_kp[motor]:.0f}")
-
-                # Return to zero
-                self._demo_send(f"{motor}P0.0\n")
-                time.sleep(0.005)
-                self._demo_send(f"{motor}K{demo_kp[motor]:.4f}\n")
-                time.sleep(0.005)
-                self._demo_wait(0.5)
-
-            # Set final tuned Kp for motors that don't move (hold position)
+            # Zero outer PID gains — prevents inner+outer stiffness doubling
+            # which causes oscillation when motor overshoots during trajectory.
+            self._demo_log("Zeroing outer PID gains (G/H/J) for trajectory")
             for motor in [1, 2, 3, 4]:
-                if motor not in demo_kp:
-                    demo_kp[motor] = 15.0
-                self._demo_send(f"{motor}K{demo_kp[motor]:.4f}\n")
+                self._demo_send(f"{motor}G0.0\n")
                 time.sleep(0.005)
-
-            self._demo_set_status("Tuning complete")
-            self._demo_wait(0.5)
+                self._demo_send(f"{motor}H0.0\n")
+                time.sleep(0.005)
+                self._demo_send(f"{motor}J0.0\n")
+                time.sleep(0.005)
 
             if self.demo_abort:
                 return
@@ -752,39 +689,58 @@ class RobotArmGUI:
                 name = seg["name"]
                 duration = seg["duration"] / speed
                 targets = seg["targets"]
+                tff = seg.get("tff", {})
+
+                for motor, val in tff.items():
+                    self._demo_send(f"{motor}T{val:.4f}\n")
+                    time.sleep(0.005)
 
                 if not targets:
                     self._demo_set_status(f"Pause...")
+                    self._demo_log(f"Pause ({duration:.1f}s)")
                     self._demo_wait(duration)
                 else:
                     self._demo_set_status(name)
-                    self._run_segment(targets, duration)
+                    self._demo_log(f"Segment: {name} ({duration:.1f}s)")
+                    self._run_segment(targets, duration, demo_offset)
+
+                for motor in tff:
+                    self._demo_send(f"{motor}T0.0000\n")
+                    time.sleep(0.005)
 
             if self.demo_abort:
                 return
 
             # --- Phase 4: Settle ---
             self._demo_set_status("Settling...")
+            self._demo_log("Settling")
             for motor in [1, 2, 3, 4]:
-                self._demo_send(f"{motor}P0.0\n")
+                self._demo_send(f"{motor}P{demo_offset[motor]:.4f}\n")
                 time.sleep(0.005)
                 self._demo_send(f"{motor}V0.0\n")
                 time.sleep(0.005)
-            self.demo_last_pos = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+                self.demo_last_pos[motor] = demo_offset[motor]
             self._demo_wait(1.0)
 
+            self._demo_log("Demo complete")
             self._demo_finish("Demo complete")
 
         except Exception as e:
+            self._demo_log(f"Error: {e}")
             self._demo_finish(f"Error: {e}")
         finally:
-            # Restore all saved gains (inner Kp/Kd + outer PID)
+            # Restore inner Kp/Kd and outer PID gains (G/H/J), clear tff
+            self._demo_log("Restoring gains")
+            for motor in [1, 2, 3, 4]:
+                self._demo_send(f"{motor}T0.0000\n")
+                time.sleep(0.005)
             for motor, gains in saved_gains.items():
                 for cmd, val in gains.items():
                     self._demo_send(f"{motor}{cmd}{val:.4f}\n")
                     time.sleep(0.005)
             if self.demo_abort:
                 # Emergency stop: zero velocity, hold position
+                self._demo_log("Demo aborted — holding position")
                 for motor in [1, 2, 3, 4]:
                     self._demo_send(f"{motor}V0.0\n")
                     time.sleep(0.003)
@@ -801,16 +757,22 @@ class RobotArmGUI:
                 break
             time.sleep(0.020)
 
-    def _run_segment(self, targets, duration):
+    def _run_segment(self, targets, duration, demo_offset=None):
         """Run a cosine-interpolated motion segment.
-        targets: {motor_num: (start_deg, end_deg)}"""
-        DT = 0.020
+        targets: {motor_num: (start_deg, end_deg)}
+        demo_offset: {motor_num: float} — added to all p_des values so targets are
+                     relative to the arm's position when the demo started."""
+        if demo_offset is None:
+            demo_offset = {}
+        DT = 0.050  # 20 Hz — gives the outer PID time to settle between updates
         t0 = time.perf_counter()
         next_tick = t0
 
         targets_rad = {}
         for motor, (start_deg, end_deg) in targets.items():
-            targets_rad[motor] = (math.radians(start_deg), math.radians(end_deg))
+            offset = demo_offset.get(motor, 0.0)
+            targets_rad[motor] = (math.radians(start_deg) + offset,
+                                  math.radians(end_deg) + offset)
 
         while not self.demo_abort:
             elapsed = time.perf_counter() - t0

@@ -16,7 +16,7 @@
   *   P=position (rad for motors, degrees for servos)
   *   V=velocity feedforward, K=inner MIT kp, D=inner MIT kd, T=torque offset
   *   G=outer PID Kp, H=outer PID Kd, J=outer PID Ki
-  *   E=enable, I=CAN_ID, A=type
+  *   E=enable, R=passive feedback (0xFC poll, no torque), I=CAN_ID, A=type
   *   0X = emergency stop (hold all motors at current position)
   *
   * AK60 uses extended CAN ID:  ExtId = CAN_ID | (8 << 8)
@@ -495,6 +495,29 @@ int main(void)
 
     HAL_Delay(100);
 
+    // Send zero-torque to all motors on startup to suppress power-on snap.
+    // Motors that retained MIT mode from a previous session will receive kp=0,
+    // kd=0, tff=0 and stay limp instead of snapping to their stale setpoint.
+    for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+        MotorState *m = uart_cmd_motor(i);
+        float saved_kp = m->kp;
+        float saved_kd = m->kd;
+        m->kp  = 0.0f;
+        m->kd  = 0.0f;
+        m->tff = 0.0f;
+        for (int j = 0; j < 3; j++) {
+            if (m->type == MOTOR_TYPE_AK60)
+                send_ak60_cmd(m);
+            else if (m->type == MOTOR_TYPE_AK40)
+                send_ak40_cmd(m);
+            else
+                send_ak70_cmd(m);
+            HAL_Delay(10);
+        }
+        m->kp = saved_kp;
+        m->kd = saved_kd;
+    }
+
     /* USER CODE END 2 */
 
     /* USER CODE BEGIN WHILE */
@@ -514,7 +537,6 @@ int main(void)
             if (m->set_origin_pending) {
                 if (m->type == MOTOR_TYPE_AK60) {
                     // Software-only origin: offset translates user coords to MIT coords
-                    // Don't send CAN set origin — it only resets servo feedback, not MIT
                     m->pos_offset += m->fb_pos;
                 } else {
                     send_ak70_set_origin(m);
@@ -593,8 +615,27 @@ int main(void)
                 m->enabled = 1;
             }
 
-            // Only send position commands to enabled motors
-            if (!m->enabled) continue;
+            // Passive feedback mode: poll state via 0xFC, no torque applied
+            if (m->fb_only) {
+                if (m->type != MOTOR_TYPE_AK60)
+                    send_ak70_enable(m);  // 0xFC — triggers state response, no control
+                continue;
+            }
+
+            // Non-enabled motors get a continuous zero-torque packet so that
+            // if they power on after the STM32 they still snap to nothing.
+            if (!m->enabled) {
+                float saved_kp = m->kp, saved_kd = m->kd, saved_tff = m->tff;
+                m->kp = 0.0f; m->kd = 0.0f; m->tff = 0.0f;
+                if (m->type == MOTOR_TYPE_AK60)
+                    send_ak60_cmd(m);
+                else if (m->type == MOTOR_TYPE_AK40)
+                    send_ak40_cmd(m);
+                else
+                    send_ak70_cmd(m);
+                m->kp = saved_kp; m->kd = saved_kd; m->tff = saved_tff;
+                continue;
+            }
 
             // Rate-limit position: ramp cmd_pos toward m->pos
             float target = m->pos;
