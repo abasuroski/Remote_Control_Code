@@ -27,12 +27,6 @@ void uart_cmd_init(void)
     motors[0].enabled = 0;
     motors[0].set_origin_pending = 0;
     motors[0].pos_offset = 0.0f;
-    motors[0].pid_kp = 25.0f;
-    motors[0].pid_kd = 0.0f;
-    motors[0].pid_ki = 0.3f;
-    motors[0].pid_integral = 0.0f;
-    motors[0].pid_prev_error = 0.0f;
-    motors[0].pid_active = 0;
     motors[0].fb_only = 0;
 
     // Motor 2: AK70, CAN ID 1 (needs enable)
@@ -46,11 +40,6 @@ void uart_cmd_init(void)
     motors[1].enable_pending = 0;
     motors[1].enabled = 0;
     motors[1].set_origin_pending = 0;
-    motors[1].pid_kp = 5.0f;
-    motors[1].pid_kd = 0.0f;
-    motors[1].pid_ki = 0.0f;    // no integral; inner kp handles steady-state gravity error
-    motors[1].pid_integral = 0.0f;
-    motors[1].pid_prev_error = 0.0f;
     motors[1].fb_only = 0;
 
     // Motor 3: AK70, CAN ID 2 (needs enable)
@@ -64,11 +53,6 @@ void uart_cmd_init(void)
     motors[2].enable_pending = 0;
     motors[2].enabled = 0;
     motors[2].set_origin_pending = 0;
-    motors[2].pid_kp = 5.0f;
-    motors[2].pid_kd = 0.0f;
-    motors[2].pid_ki = 0.0f;
-    motors[2].pid_integral = 0.0f;
-    motors[2].pid_prev_error = 0.0f;
     motors[2].fb_only = 0;
 
     // Motor 4: AK40, CAN ID 3 (needs enable)
@@ -82,11 +66,6 @@ void uart_cmd_init(void)
     motors[3].enable_pending = 0;
     motors[3].enabled = 0;
     motors[3].set_origin_pending = 0;
-    motors[3].pid_kp = 4.0f;
-    motors[3].pid_kd = 0.0f;
-    motors[3].pid_ki = 0.0f;
-    motors[3].pid_integral = 0.0f;
-    motors[3].pid_prev_error = 0.0f;
     motors[3].fb_only = 0;
 
 
@@ -134,22 +113,11 @@ static void parse_cmd(void)
     MotorState *m = &motors[motor_num];
 
     switch (cmd) {
-        case 'P': case 'p':
-            m->pos = val;
-            m->pid_integral = 0.0f;
-            m->pid_prev_error = m->fb_pos;
-            m->pid_active = 1;
-            break;
+        case 'P': case 'p': m->pos = val; break;
         case 'V': case 'v': m->vel = val; break;
-        case 'K': case 'k': m->kp  = val; break;  // inner MIT spring gain
-        case 'D': case 'd': m->kd  = val; break;  // inner MIT damper gain
+        case 'K': case 'k': m->kp  = val; break;
+        case 'D': case 'd': m->kd  = val; break;
         case 'T': case 't': m->tff = val; break;
-        case 'G': case 'g': m->pid_kp = val; break;              // outer PID P gain
-        case 'H': case 'h': m->pid_kd = val; break;              // outer PID D gain
-        case 'J': case 'j':
-            m->pid_ki = val;
-            m->pid_integral = 0.0f;
-            break;
         case 'E': case 'e':
             m->enable_pending = 1;
             m->fb_only = 0;
@@ -160,16 +128,6 @@ static void parse_cmd(void)
             m->enable_pending = 0;
             break;
         case 'O': case 'o': m->set_origin_pending = 1; break;
-        case 'I': case 'i': m->can_id = (uint8_t)val; break;
-        case 'A': case 'a':
-            if ((int)val == 70)
-                m->type = MOTOR_TYPE_AK70;
-            else if ((int)val == 40)
-                m->type = MOTOR_TYPE_AK40;
-            else
-                m->type = MOTOR_TYPE_AK60;
-            m->enabled = 0;
-            break;
         default: break;
     }
 }

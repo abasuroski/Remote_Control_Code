@@ -17,7 +17,7 @@ typedef struct {
     float vel;
     float kp;           // inner MIT spring gain (set via K command)
     float kd;           // inner MIT damper gain (set via D command)
-    float tff;          // torque feedforward (computed by outer PID; also settable via T command)
+    float tff;          // torque feedforward (set via T command)
     uint8_t can_id;
     MotorType type;
     uint8_t enable_pending;
@@ -25,14 +25,8 @@ typedef struct {
     uint8_t set_origin_pending;
     volatile float fb_pos;
     volatile uint8_t fb_received;
+    volatile uint32_t fb_tick;
     float pos_offset;
-    // Outer STM32 PID (set via G/H/J commands)
-    float pid_kp;
-    float pid_kd;
-    float pid_ki;
-    float pid_integral;
-    float pid_prev_error;
-    uint8_t pid_active;
     uint8_t fb_only;     // 1 = poll state via 0xFC, no torque (set via R command)
 } MotorState;
 

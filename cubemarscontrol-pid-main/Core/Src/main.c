@@ -2,21 +2,21 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Robot arm UART remote control (4 motors + 3 servos) — PID version
+  * @brief          : Robot arm UART remote control (4 motors + 3 servos)
+  *
+  * Thin passthrough: receives MIT control commands from a PC controller
+  * over UART, packs CAN frames, and forwards motor feedback back over UART.
+  * All trajectory generation, PID, and gain scheduling live on the PC side.
   *
   * Controls up to 4 CubeMars motors (AK60, AK70/80, or AK40) via CAN bus,
   * and 3 MG995 servos via TIM2 PWM (end effector).
-  *
-  * STM32-side outer PID loop feeds torque (tff) into the MIT CAN frame.
-  * Inner MIT kp/kd are small fixed values for high-frequency stability only.
   *
   * Protocol: <motor_num><cmd><value>\n
   *   motor_num = 1-4 (Body: Base, Shoulder, Elbow, Linkage)
   *   motor_num = 5-7 (End Effector: Wrist1, Wrist2, Gripper)
   *   P=position (rad for motors, degrees for servos)
   *   V=velocity feedforward, K=inner MIT kp, D=inner MIT kd, T=torque offset
-  *   G=outer PID Kp, H=outer PID Kd, J=outer PID Ki
-  *   E=enable, R=passive feedback (0xFC poll, no torque), I=CAN_ID, A=type
+  *   E=enable, R=passive feedback (0xFC poll, no torque)
   *   0X = emergency stop (hold all motors at current position)
   *
   * AK60 uses extended CAN ID:  ExtId = CAN_ID | (8 << 8)
@@ -77,10 +77,9 @@ UART_HandleTypeDef huart2;
 
 #define CAN_PACKET_MIT 8
 
-// Position rate limit: max rad/s the commanded position can change
-// At 2 rad/s with ~10ms loop, max step per iteration = 0.02 rad
-#define POS_RATE_LIMIT  2.0f
-#define LOOP_DT         0.012f
+// Feedback watchdog: if an enabled motor stops responding for this many ms,
+// disable it and send zero-gain frames to prevent snap on power recovery.
+#define FB_WATCHDOG_MS  200
 
 // Servo PWM: 50Hz, 1us resolution (prescaler=84-1, period=20000-1)
 // MG995: center at 1500us, ~8.33us per degree
@@ -98,9 +97,6 @@ uint8_t  rxData[8];
 uint32_t txMailbox;
 
 uint8_t uart_rx_byte;
-
-// Rate-limited commanded position for each motor (ramps toward m->pos)
-static float cmd_pos[NUM_MOTORS] = {0};
 
 // Feedback ring buffer — ISR writes, main loop transmits
 #define FB_BUF_SIZE 512
@@ -143,6 +139,12 @@ static void         unpack_ak40_reply(uint8_t motor_idx);
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
+
+// DWT cycle counter → microseconds (wraps at ~51 s)
+static inline uint32_t get_us(void)
+{
+    return DWT->CYCCNT / (SystemCoreClock / 1000000U);
+}
 
 static uint32_t servo_angle_to_pulse(float angle_deg)
 {
@@ -333,15 +335,17 @@ static void unpack_ak60_reply(uint8_t motor_idx)
     float cur = (float)cur_int * 0.01f;
     int8_t temp = (int8_t)rxData[6];
     int8_t err  = (int8_t)rxData[7];
+    uint32_t ts = HAL_GetTick();
 
     MotorState *m = uart_cmd_motor(motor_idx);
     m->fb_pos = pos * 0.01745329f - m->pos_offset;
     m->fb_received = 1;
+    m->fb_tick = ts;
 
-    char buf[96];
+    char buf[128];
     int len = snprintf(buf, sizeof(buf),
-        "[M%d] pos=%.1f deg  spd=%.0f eRPM  I=%.2f A  T=%d  err=%d\r\n",
-        motor_idx + 1, (double)(m->fb_pos / 0.01745329f), (double)spd, (double)cur, temp, err);
+        "[M%d] pos=%.1f deg  spd=%.0f eRPM  I=%.2f A  T=%d  err=%d  t=%lums\r\n",
+        motor_idx + 1, (double)(m->fb_pos / 0.01745329f), (double)spd, (double)cur, temp, err, (unsigned long)ts);
     fb_write(buf, len);
 }
 
@@ -357,15 +361,17 @@ static void unpack_ak70_reply(uint8_t motor_idx)
     float tau = uint_to_float(i_int, -AK70_T_MAX, AK70_T_MAX, 12);
     int8_t temp = (int8_t)(rxData[6] - 40);
     int8_t err  = (int8_t)rxData[7];
+    uint32_t ts = HAL_GetTick();
 
     MotorState *m = uart_cmd_motor(motor_idx);
     m->fb_pos = pos;
     m->fb_received = 1;
+    m->fb_tick = ts;
 
-    char buf[96];
+    char buf[128];
     int len = snprintf(buf, sizeof(buf),
-        "[M%d] pos=%.3f rad  vel=%.2f  tau=%.2f  T=%d  err=%d\r\n",
-        motor_idx + 1, (double)pos, (double)vel, (double)tau, temp, err);
+        "[M%d] pos=%.3f rad  vel=%.2f  tau=%.2f  T=%d  err=%d  t=%lums\r\n",
+        motor_idx + 1, (double)pos, (double)vel, (double)tau, temp, err, (unsigned long)ts);
     fb_write(buf, len);
 }
 
@@ -381,15 +387,17 @@ static void unpack_ak40_reply(uint8_t motor_idx)
     float tau = uint_to_float(i_int, -AK40_T_MAX, AK40_T_MAX, 12);
     int8_t temp = (int8_t)(rxData[6] - 40);
     int8_t err  = (int8_t)rxData[7];
+    uint32_t ts = HAL_GetTick();
 
     MotorState *m = uart_cmd_motor(motor_idx);
     m->fb_pos = pos;
     m->fb_received = 1;
+    m->fb_tick = ts;
 
-    char buf[96];
+    char buf[128];
     int len = snprintf(buf, sizeof(buf),
-        "[M%d] pos=%.3f rad  vel=%.2f  tau=%.2f  T=%d  err=%d\r\n",
-        motor_idx + 1, (double)pos, (double)vel, (double)tau, temp, err);
+        "[M%d] pos=%.3f rad  vel=%.2f  tau=%.2f  T=%d  err=%d  t=%lums\r\n",
+        motor_idx + 1, (double)pos, (double)vel, (double)tau, temp, err, (unsigned long)ts);
     fb_write(buf, len);
 }
 
@@ -433,25 +441,41 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART2) {
+        // Detect "PING\n" and respond immediately with a timestamped PONG.
+        // Responding in the ISR (not the ring buffer) keeps the round-trip
+        // time as short as possible for accurate clock-offset estimation.
+        // "PING\n" is harmless to uart_cmd_feed: 'P'-'1' is out of motor range.
+        static char  ping_buf[5];
+        static uint8_t ping_idx = 0;
+        if (uart_rx_byte == '\n' || uart_rx_byte == '\r') {
+            ping_buf[ping_idx] = '\0';
+            if (ping_idx == 4 &&
+                ping_buf[0] == 'P' && ping_buf[1] == 'I' &&
+                ping_buf[2] == 'N' && ping_buf[3] == 'G') {
+                char pong[32];
+                int plen = snprintf(pong, sizeof(pong), "PONG t=%luus\r\n",
+                                    (unsigned long)get_us());
+                HAL_UART_Transmit(&huart2, (uint8_t *)pong, (uint16_t)plen, 10);
+            }
+            ping_idx = 0;
+        } else if (ping_idx < 4) {
+            ping_buf[ping_idx++] = (char)uart_rx_byte;
+        }
+
         uart_cmd_feed(uart_rx_byte);
         HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
     }
 }
 
 // Freeze all enabled motors at their last known feedback position.
-// Safe to call from ISR context (only writes to MotorState fields and cmd_pos).
 static void do_e_stop(void)
 {
     for (uint8_t i = 0; i < NUM_MOTORS; i++) {
         MotorState *m = uart_cmd_motor(i);
         if (m->enabled) {
-            if (m->fb_received) {
+            if (m->fb_received)
                 m->pos = m->fb_pos;
-                cmd_pos[i] = m->fb_pos;
-            }
-            m->pid_integral    = 0.0f;
-            m->pid_prev_error  = 0.0f;
-            m->tff             = 0.0f;
+            m->tff = 0.0f;
         }
     }
 }
@@ -475,6 +499,11 @@ int main(void)
     MX_USART2_UART_Init();
 
     /* USER CODE BEGIN 2 */
+
+    // Enable DWT cycle counter for microsecond timestamps
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT       = 0;
+    DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;
 
     HAL_CAN_Start(&hcan1);
     HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
@@ -543,10 +572,7 @@ int main(void)
                 }
                 HAL_Delay(10);
                 m->pos = 0.0f;
-                cmd_pos[i] = 0.0f;
                 m->fb_pos = 0.0f;
-                m->pid_integral   = 0.0f;
-                m->pid_prev_error = 0.0f;
                 m->set_origin_pending = 0;
             }
 
@@ -580,18 +606,14 @@ int main(void)
                         send_ak70_cmd(m);
                     HAL_Delay(10);
                 }
-                if (m->fb_received) {
-                    m->pos     = m->fb_pos;
-                    cmd_pos[i] = m->fb_pos;
-                }
+                if (m->fb_received)
+                    m->pos = m->fb_pos;
                 m->kp = kp_target;
                 m->kd = kd_target;
 
                 for (int j = 1; j <= 50; j++) {
-                    if (m->fb_received && j <= 5) {
-                        m->pos     = m->fb_pos;
-                        cmd_pos[i] = m->fb_pos;
-                    }
+                    if (m->fb_received && j <= 5)
+                        m->pos = m->fb_pos;
 
                     m->kp = kp_target * (float)j / 50.0f;
                     m->kd = kd_target * (float)j / 50.0f;
@@ -608,9 +630,6 @@ int main(void)
                 m->kp = kp_target;
                 m->kd = kd_target;
 
-                m->pid_integral   = 0.0f;
-                m->pid_prev_error = m->fb_pos;
-                m->pid_active     = 0;
                 m->enable_pending = 0;
                 m->enabled = 1;
             }
@@ -637,16 +656,19 @@ int main(void)
                 continue;
             }
 
-            // Rate-limit position: ramp cmd_pos toward m->pos
-            float target = m->pos;
-            float pos_err = target - cmd_pos[i];
-            float max_step = POS_RATE_LIMIT * LOOP_DT;
-            if (pos_err > max_step)
-                cmd_pos[i] += max_step;
-            else if (pos_err < -max_step)
-                cmd_pos[i] -= max_step;
-            else
-                cmd_pos[i] = target;
+            // Feedback watchdog: if this motor lost power or stopped
+            // responding, disable it so it doesn't snap on recovery.
+            if (m->fb_received &&
+                (HAL_GetTick() - m->fb_tick) > FB_WATCHDOG_MS) {
+                m->enabled = 0;
+                m->tff = 0.0f;
+                char wdg[64];
+                int wlen = snprintf(wdg, sizeof(wdg),
+                    "[M%d] feedback lost — disabled (re-enable required)\r\n",
+                    i + 1);
+                fb_write(wdg, wlen);
+                continue;
+            }
 
             // Clamp torque to motor limits
             float t_max;
@@ -656,37 +678,6 @@ int main(void)
                 t_max = AK40_T_MAX;
             else
                 t_max = AK70_T_MAX;
-
-            float tff_pid = 0.0f;
-            if (m->pid_active) {
-                float pid_error = cmd_pos[i] - m->fb_pos;
-
-                // Safety clamp: if error exceeds 1 rad (~57 deg), kill outer PID
-                // and let the inner MIT spring handle recovery alone
-                if (pid_error > 1.0f || pid_error < -1.0f) {
-                    m->pid_active = 0;
-                    m->pid_integral = 0.0f;
-                    m->tff = 0.0f;
-                } else {
-                    float dfb = (m->fb_pos - m->pid_prev_error) / LOOP_DT;
-                    m->pid_prev_error = m->fb_pos;
-                    m->pid_integral += pid_error * LOOP_DT;
-                    float i_max = (m->pid_ki > 0.001f) ? (t_max / m->pid_ki) : 0.0f;
-                    if (m->pid_integral > i_max) m->pid_integral = i_max;
-                    if (m->pid_integral < -i_max) m->pid_integral = -i_max;
-                    tff_pid = m->pid_kp * pid_error
-                            - m->pid_kd * dfb
-                            + m->pid_ki * m->pid_integral;
-                    if (tff_pid > t_max) tff_pid = t_max;
-                    if (tff_pid < -t_max) tff_pid = -t_max;
-                }
-            }
-
-            // Send CAN frame with rate-limited position and PID torque
-            float saved_pos = m->pos;
-            float saved_tff = m->tff;
-            m->pos = cmd_pos[i];
-            m->tff = tff_pid + saved_tff;
             if (m->tff > t_max) m->tff = t_max;
             if (m->tff < -t_max) m->tff = -t_max;
 
@@ -697,19 +688,22 @@ int main(void)
             else
                 send_ak70_cmd(m);
 
-            m->pos = saved_pos;
-            m->tff = saved_tff;
             HAL_Delay(2);
         }
 
         // Update servo PWM outputs
         update_servos();
 
-        // Drain feedback buffer over UART (non-ISR context)
+        // Drain feedback buffer over UART (non-ISR context).
+        // Transmit contiguous chunks to avoid per-byte function call overhead.
         while (fb_tail != fb_head) {
-            uint8_t c = (uint8_t)fb_buf[fb_tail];
-            HAL_UART_Transmit(&huart2, &c, 1, 2);
-            fb_tail = (fb_tail + 1) % FB_BUF_SIZE;
+            uint16_t chunk;
+            if (fb_head > fb_tail)
+                chunk = fb_head - fb_tail;
+            else
+                chunk = FB_BUF_SIZE - fb_tail;
+            HAL_UART_Transmit(&huart2, (uint8_t *)&fb_buf[fb_tail], chunk, 50);
+            fb_tail = (fb_tail + chunk) % FB_BUF_SIZE;
         }
 
         HAL_Delay(2);
@@ -829,7 +823,7 @@ static void MX_TIM2_Init(void)
 static void MX_USART2_UART_Init(void)
 {
     huart2.Instance          = USART2;
-    huart2.Init.BaudRate     = 115200;
+    huart2.Init.BaudRate     = 1000000;
     huart2.Init.WordLength   = UART_WORDLENGTH_8B;
     huart2.Init.StopBits     = UART_STOPBITS_1;
     huart2.Init.Parity       = UART_PARITY_NONE;
