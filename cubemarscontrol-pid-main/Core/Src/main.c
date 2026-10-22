@@ -79,7 +79,7 @@ UART_HandleTypeDef huart2;
 
 // Feedback watchdog: if an enabled motor stops responding for this many ms,
 // disable it and send zero-gain frames to prevent snap on power recovery.
-#define FB_WATCHDOG_MS  200
+#define FB_WATCHDOG_MS  2000
 
 // Servo PWM: 50Hz, 1us resolution (prescaler=84-1, period=20000-1)
 // MG995: center at 1500us, ~8.33us per degree
@@ -721,18 +721,21 @@ void SystemClock_Config(void)
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
     __HAL_RCC_PWR_CLK_ENABLE();
-    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+    // Scale 1: full voltage regulation — better stability for active control vs low-power Scale 3
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-    RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
-    RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
-    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-    RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSI;
-    RCC_OscInitStruct.PLL.PLLM            = 16;
-    RCC_OscInitStruct.PLL.PLLN            = 336;
-    RCC_OscInitStruct.PLL.PLLP            = RCC_PLLP_DIV4;
-    RCC_OscInitStruct.PLL.PLLQ            = 2;
-    RCC_OscInitStruct.PLL.PLLR            = 2;
+    // HSE via ST-Link MCO on PH0 (bypass mode, 8 MHz).
+    // SYSCLK = 8 MHz / 4 * 168 / 4 = 84 MHz — same frequency as before, but crystal-accurate.
+    // If the board hangs here, check that SB54/SB55 solder bridges are closed on the Nucleo.
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState       = RCC_HSE_BYPASS;
+    RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM       = 4;    // 8 MHz / 4 = 2 MHz VCO input
+    RCC_OscInitStruct.PLL.PLLN       = 168;  // 2 MHz * 168 = 336 MHz VCO
+    RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV4;  // 336 / 4 = 84 MHz SYSCLK
+    RCC_OscInitStruct.PLL.PLLQ       = 7;    // 336 / 7 = 48 MHz (USB)
+    RCC_OscInitStruct.PLL.PLLR       = 2;
     if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
 
     RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
