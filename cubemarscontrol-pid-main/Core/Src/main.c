@@ -81,6 +81,11 @@ UART_HandleTypeDef huart2;
 // disable it and send zero-gain frames to prevent snap on power recovery.
 #define FB_WATCHDOG_MS  2000
 
+// Set to 1 to echo every outgoing CAN command frame back to the PC over UART.
+// Only fires for enabled motors (not zero-torque idle or soft-start frames).
+// Toggle off in production to save ~30 KB/s of UART bandwidth.
+#define TX_ECHO  0
+
 // Servo PWM: 50Hz, 1us resolution (prescaler=84-1, period=20000-1)
 // MG995: center at 1500us, ~8.33us per degree
 // Pulse clamped to 500-2500us for safety
@@ -99,7 +104,7 @@ uint32_t txMailbox;
 uint8_t uart_rx_byte;
 
 // Feedback ring buffer — ISR writes, main loop transmits
-#define FB_BUF_SIZE 512
+#define FB_BUF_SIZE 1024
 static char fb_buf[FB_BUF_SIZE];
 static volatile uint16_t fb_head = 0;
 static volatile uint16_t fb_tail = 0;
@@ -265,6 +270,18 @@ static void send_ak40_cmd(MotorState *m)
     txHeader.TransmitGlobalTime = DISABLE;
     send_can_frame();
 }
+
+#if TX_ECHO
+static void log_tx_cmd(uint8_t motor_idx, MotorState *m)
+{
+    char buf[80];
+    int len = snprintf(buf, sizeof(buf),
+        "[TX M%d] pos=%6.3f vel=%5.2f kp=%5.1f kd=%4.2f tff=%5.2f\r\n",
+        motor_idx + 1, (double)m->pos, (double)m->vel,
+        (double)m->kp, (double)m->kd, (double)m->tff);
+    fb_write(buf, len);
+}
+#endif
 
 // AK70/80 enable: 0xFF x7 + 0xFC
 static void send_ak70_enable(MotorState *m)
@@ -687,6 +704,10 @@ int main(void)
                 send_ak40_cmd(m);
             else
                 send_ak70_cmd(m);
+
+#if TX_ECHO
+            log_tx_cmd(i, m);
+#endif
 
             HAL_Delay(2);
         }
